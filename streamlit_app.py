@@ -18,6 +18,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import pydeck as pdk
 import streamlit as st
+import folium
+from streamlit_folium import st_folium
+from src.greenery.vegetation import analyze_vegetation
 
 
 st.set_page_config(page_title="Healthy City Index — Mumbai", layout="wide")
@@ -27,48 +30,58 @@ st.set_page_config(page_title="Healthy City Index — Mumbai", layout="wide")
 class RegionData:
     lat: float
     lon: float
-    air_pm25: float
-    air_no2: float
-    water_turbidity: float
     ndvi: float
-    pop_density: float
-    lst_c: float
-    industrial_km: float
+    ndwi: float
+    ndbi: float
+    savi: float
 
 
 DEFAULT_POINT: Dict[str, float] = {"lat": 19.0760, "lon": 72.8777}
 DEFAULT_REGION = RegionData(
     lat=DEFAULT_POINT["lat"],
     lon=DEFAULT_POINT["lon"],
-    air_pm25=40.0,
-    air_no2=25.0,
-    water_turbidity=5.0,
-    ndvi=0.40,
-    pop_density=12_000,
-    lst_c=32.0,
-    industrial_km=3.0,
+    ndvi=0.0,
+    ndwi=0.0,
+    ndbi=0.0,
+    savi=0.0,
 )
 
 
-def _noise(lat: float, lon: float, seed: int) -> float:
-    return abs(math.sin(lat * 5 + lon * 3 + seed)) % 1.0
-
-
-def fetch_region_data(lat: float, lon: float) -> RegionData:
-    n = [_noise(lat, lon, i) for i in range(1, 8)]
+def fetch_region_data(lat: float, lon: float, bounding_box: dict = None) -> RegionData:
+    # Initialize vegetation data with default values
+    vegetation_data = {
+        "ndvi": 0.0,
+        "ndwi": 0.0,
+        "ndbi": 0.0,
+        "savi": 0.0,
+    }
+    
+    # Get real vegetation data if bounding box is provided
+    if bounding_box:
+        try:
+            st.info("🌱 Analyzing vegetation data... This may take a few seconds.")
+            vegetation_data = analyze_vegetation(
+                bounding_box["north"], 
+                bounding_box["south"], 
+                bounding_box["east"], 
+                bounding_box["west"]
+            )
+            st.success("✅ Vegetation analysis completed!")
+        except Exception as e:
+            st.error(f"❌ Vegetation analysis failed: {e}")
+            return DEFAULT_REGION
+    
     try:
         return RegionData(
             lat=lat,
             lon=lon,
-            air_pm25=round(20 + 80 * n[0], 1),
-            air_no2=round(10 + 60 * n[1], 1),
-            water_turbidity=round(1 + 15 * n[2], 1),
-            ndvi=round(0.15 + 0.6 * n[3], 2),
-            pop_density=int(round(3000 + 25_000 * n[4])),
-            lst_c=round(28 + 10 * n[5], 1),
-            industrial_km=round(0.1 + 8.0 * n[6], 2),
+            ndvi=vegetation_data["ndvi"],
+            ndwi=vegetation_data["ndwi"],
+            ndbi=vegetation_data["ndbi"],
+            savi=vegetation_data["savi"],
         )
-    except Exception:
+    except Exception as e:
+        st.error(f"Error creating RegionData: {e}")
         return DEFAULT_REGION
 
 
@@ -84,24 +97,19 @@ def _minmax(v: float, lo: float, hi: float, invert: bool = False) -> float:
 
 def compute_scores(data: RegionData) -> Dict[str, float]:
     return {
-        "air": 0.5 * _minmax(data.air_pm25, 10, 100, invert=True)
-        + 0.5 * _minmax(data.air_no2, 5, 80, invert=True),
-        "water": _minmax(data.water_turbidity, 1, 20, invert=True),
-        "green": _minmax(data.ndvi, 0.1, 0.8),
-        "population": _minmax(data.pop_density, 1_000, 30_000, invert=True),
-        "temperature": _minmax(data.lst_c, 26, 40, invert=True),
-        "industrial": _minmax(data.industrial_km, 0.1, 10.0),
+        "ndvi": _minmax(data.ndvi, 0.1, 0.8),
+        "ndwi": _minmax(data.ndwi, 0.1, 0.8),
+        "ndbi": _minmax(data.ndbi, 0.1, 0.8),
+        "savi": _minmax(data.savi, 0.1, 0.8),
     }
 
 
 def composite(scores: Dict[str, float]) -> float:
     weights = {
-        "air": 0.22,
-        "water": 0.14,
-        "green": 0.18,
-        "population": 0.12,
-        "temperature": 0.20,
-        "industrial": 0.14,
+        "ndvi": 0.4,
+        "ndwi": 0.2,
+        "ndbi": 0.2,
+        "savi": 0.2,
     }
     value = sum(scores[k] * weights[k] for k in weights)
     return round(value, 3)
@@ -110,49 +118,40 @@ def composite(scores: Dict[str, float]) -> float:
 def recommendations(data: RegionData, scores: Dict[str, float]) -> Dict[str, str | float]:
     hci = composite(scores)
     habitability = (
-        "Generally habitable – favorable profile."
+        "Excellent vegetation health – very green area."
         if hci >= 0.7
-        else "Marginally habitable – mixed; targeted fixes."
+        else "Good vegetation health – moderate greenery."
         if hci >= 0.5
-        else "Not ideal – multiple risks; mitigate first."
+        else "Poor vegetation health – needs improvement."
     )
 
     if data.ndvi >= 0.45:
-        parks = "Adequate greenery; preserve & add pocket parks."
+        parks = "High vegetation density; preserve existing greenery."
     elif data.ndvi >= 0.30:
-        parks = "Moderate greenery; corridor greening & shade trees."
+        parks = "Moderate vegetation; consider adding more green spaces."
     else:
-        parks = "Low greenery; prioritize parks & streetscape planting."
+        parks = "Low vegetation; prioritize planting trees and creating parks."
 
-    if data.pop_density > 15_000 and data.industrial_km < 2:
-        waste = "High waste pressure; deploy MRF/transfer stations & audits."
-    elif data.pop_density > 15_000:
-        waste = "Elevated waste; scale collection & segregation."
+    if data.ndwi >= 0.3:
+        water = "Good water presence; maintain water bodies."
+    elif data.ndwi >= 0.1:
+        water = "Moderate water presence; consider water conservation."
     else:
-        waste = "Standard services likely sufficient; maintain programs."
+        water = "Low water presence; implement water management strategies."
 
-    risk = sum(
-        [
-            data.air_pm25 > 60,
-            data.lst_c > 34,
-            data.pop_density > 20_000,
-            data.water_turbidity > 10,
-        ]
-    )
-    disease = (
-        "High risk: clinics, heat shelters, vector control, potable water."
-        if risk >= 3
-        else "Moderate risk: monitor hotspots, shade/water points, seasonal drives."
-        if risk == 2
-        else "Low–moderate risk: routine surveillance & outreach."
-    )
+    if data.ndbi >= 0.2:
+        builtup = "High built-up area; balance with green infrastructure."
+    elif data.ndbi >= 0.1:
+        builtup = "Moderate built-up area; maintain green balance."
+    else:
+        builtup = "Low built-up area; good for natural development."
 
     return {
         "hci": hci,
         "habitability": habitability,
         "parks": parks,
-        "waste": waste,
-        "disease": disease,
+        "water": water,
+        "builtup": builtup,
     }
 
 
@@ -203,7 +202,7 @@ def _map_layers(point: Dict[str, float]) -> Tuple[pdk.Deck, Dict[str, float]]:
 
 
 def _radar_chart(scores: Dict[str, float]) -> go.Figure:
-    categories = ["Air", "Water", "Green", "Population", "Temperature", "Industrial"]
+    categories = ["NDVI", "NDWI", "NDBI", "SAVI"]
     values = [round(scores[k.lower()], 3) * 100 for k in categories]
     return go.Figure(
         data=go.Scatterpolar(r=values + values[:1], theta=categories + categories[:1], fill="toself")
@@ -217,8 +216,8 @@ def _radar_chart(scores: Dict[str, float]) -> go.Figure:
 def main() -> None:
     _initialise_session_state()
 
-    st.title("🌆 Healthy City Index — Mumbai")
-    st.caption("Streamlit port • Mock indicators that mirror the React wireframe")
+    st.title("🌱 Vegetation Analysis — Mumbai")
+    st.caption("Real-time satellite data analysis using Google Earth Engine")
 
     col_header, col_repo = st.columns([4, 1])
     with col_repo:
@@ -235,99 +234,159 @@ def main() -> None:
 
         with col_map:
             st.subheader("Pick a location")
+            
+            # Manual coordinate input
             with st.form(key="location_form", clear_on_submit=False):
-                lat_value = st.number_input(
-                    "Latitude",
-                    min_value=18.5,
-                    max_value=20.0,
-                    value=float(st.session_state.point["lat"]),
-                    step=0.0005,
-                    format="%.4f",
-                )
-                lon_value = st.number_input(
-                    "Longitude",
-                    min_value=72.5,
-                    max_value=73.5,
-                    value=float(st.session_state.point["lon"]),
-                    step=0.0005,
-                    format="%.4f",
-                )
+                col_lat, col_lon = st.columns(2)
+                with col_lat:
+                    lat_value = st.number_input(
+                        "Latitude",
+                        min_value=18.5,
+                        max_value=20.0,
+                        value=float(st.session_state.point["lat"]),
+                        step=0.0005,
+                        format="%.4f",
+                    )
+                with col_lon:
+                    lon_value = st.number_input(
+                        "Longitude",
+                        min_value=72.5,
+                        max_value=73.5,
+                        value=float(st.session_state.point["lon"]),
+                        step=0.0005,
+                        format="%.4f",
+                    )
                 submitted = st.form_submit_button("Update location")
 
             if submitted:
                 st.session_state.point = {"lat": lat_value, "lon": lon_value}
 
-            map_deck, _ = _map_layers(st.session_state.point)
-            st.pydeck_chart(map_deck, use_container_width=True)
+            # Interactive map with click functionality using Folium
+            st.markdown("**🗺️ Click anywhere on the map to update location:**")
+            
+            # Create a Folium map
+            m = folium.Map(
+                location=[st.session_state.point["lat"], st.session_state.point["lon"]], 
+                zoom_start=11,
+                tiles='OpenStreetMap'
+            )
+            
+            # Add a marker for the current location
+            folium.Marker(
+                [st.session_state.point["lat"], st.session_state.point["lon"]],
+                popup=f"Current Location<br>Lat: {st.session_state.point['lat']:.4f}<br>Lon: {st.session_state.point['lon']:.4f}",
+                tooltip="Current Location",
+                icon=folium.Icon(color='blue', icon='info-sign')
+            ).add_to(m)
+            
+            # Add dynamic industrial area overlay based on current location
+            # Create a rectangle around the current point (simulating industrial proximity)
+            current_lat = st.session_state.point["lat"]
+            current_lon = st.session_state.point["lon"]
+            
+            # Create a small rectangle around the current location
+            rect_size = 0.01  # Adjust this to make the rectangle bigger/smaller
+            industrial_bounds = [
+                [current_lat - rect_size, current_lon - rect_size],
+                [current_lat + rect_size, current_lon + rect_size]
+            ]
+            
+            folium.Rectangle(
+                bounds=industrial_bounds,
+                color='red',
+                fill=True,
+                fillColor='red',
+                fillOpacity=0.2,
+            ).add_to(m)
+            
+            # Display the map and capture click events
+            map_data = st_folium(m, height=400, width=700, returned_objects=["last_clicked"])
+            
+            # Handle map clicks
+            if map_data and map_data.get("last_clicked"):
+                clicked_lat = map_data["last_clicked"]["lat"]
+                clicked_lon = map_data["last_clicked"]["lng"]
+                
+                # Update session state if coordinates changed significantly
+                if (abs(clicked_lat - st.session_state.point["lat"]) > 0.0001 or 
+                    abs(clicked_lon - st.session_state.point["lon"]) > 0.0001):
+                    st.session_state.point = {"lat": clicked_lat, "lon": clicked_lon}
+                    st.success(f"📍 Location updated to: {clicked_lat:.4f}, {clicked_lon:.4f}")
+                    st.rerun()
+            
             st.info(
-                "This draft uses a blank pydeck canvas. Next iterations can add cached"
-                " tiles or NASA vector overlays once data is prepared.",
+                "Click anywhere on the map above to update the location. The blue marker shows your current selection.",
                 icon="ℹ️",
             )
 
         point = st.session_state.point
-        region = fetch_region_data(point["lat"], point["lon"])
+        
+        # Create bounding box for vegetation analysis
+        rect_size = 0.01  # Same size as the rectangle on the map
+        bounding_box = {
+            "north": point["lat"] + rect_size,
+            "south": point["lat"] - rect_size,
+            "east": point["lon"] + rect_size,
+            "west": point["lon"] - rect_size
+        }
+        
+        region = fetch_region_data(point["lat"], point["lon"], bounding_box)
         scores = compute_scores(region)
         recs = recommendations(region, scores)
 
         with col_metrics:
             st.subheader(
-                f"📊 Indicators @ {region.lat:.4f}, {region.lon:.4f}"
+                f"📊 Vegetation Indices @ {region.lat:.4f}, {region.lon:.4f}"
             )
 
             metrics = [
-                ("PM2.5", f"{region.air_pm25} μg/m³"),
-                ("NO₂", f"{region.air_no2} μg/m³"),
-                ("Water turbidity", f"{region.water_turbidity} NTU"),
-                ("NDVI", f"{region.ndvi}"),
-                ("Population density", f"{region.pop_density} /km²"),
-                ("Land surface temp", f"{region.lst_c} °C"),
-                ("Industrial proximity", f"{region.industrial_km} km"),
+                ("NDVI", f"{region.ndvi:.4f}"),
+                ("NDWI", f"{region.ndwi:.4f}"),
+                ("NDBI", f"{region.ndbi:.4f}"),
+                ("SAVI", f"{region.savi:.4f}"),
             ]
 
             for label, value in metrics:
                 st.metric(label=label, value=value)
 
-            st.markdown("### Composite HCI")
-            st.metric(label="HCI (0–1, higher better)", value=f"{recs['hci']:.2f}")
+            st.markdown("### Vegetation Health Score")
+            st.metric(label="VHS (0–1, higher better)", value=f"{recs['hci']:.2f}")
             st.plotly_chart(_radar_chart(scores), use_container_width=True)
 
             st.caption(
-                "⚠️ Mock values for wireframe. Swap `fetch_region_data` with backend"
-                " calls when the Python API is ready."
+                "🌱 All vegetation indices are calculated from real satellite data using Google Earth Engine!"
             )
 
     with tab_ai:
         col_left, col_right = st.columns([1.2, 1], gap="large")
 
         with col_left:
-            st.subheader("LLM Recommendations (stub)")
+            st.subheader("Location Details")
             st.metric("Latitude", f"{region.lat:.5f}")
             st.metric("Longitude", f"{region.lon:.5f}")
-            st.metric("PM2.5", f"{region.air_pm25} μg/m³")
-            st.metric("LST", f"{region.lst_c} °C")
-            st.metric("Population density", f"{region.pop_density} /km²")
-            st.metric("Water turbidity", f"{region.water_turbidity} NTU")
+            st.metric("NDVI", f"{region.ndvi:.4f}")
+            st.metric("NDWI", f"{region.ndwi:.4f}")
+            st.metric("NDBI", f"{region.ndbi:.4f}")
+            st.metric("SAVI", f"{region.savi:.4f}")
 
         with col_right:
-            st.metric("Composite HCI", f"{recs['hci']:.2f}")
-            st.write("**Habitability:**", recs["habitability"])
-            st.write("**Parks / Greenery:**", recs["parks"])
-            st.write("**Waste Management:**", recs["waste"])
-            st.write("**Disease Risk:**", recs["disease"])
+            st.metric("Vegetation Health Score", f"{recs['hci']:.2f}")
+            st.write("**Overall Assessment:**", recs["habitability"])
+            st.write("**Vegetation Status:**", recs["parks"])
+            st.write("**Water Presence:**", recs["water"])
+            st.write("**Built-up Area:**", recs["builtup"])
             st.caption(
-                "Swap this panel with real LLM outputs by forwarding indicators and"
-                " scores as structured context."
+                "Analysis based on real satellite data from Google Earth Engine."
             )
 
     st.divider()
     st.markdown(
-        "### Map roadmap"
-        "\n1. Replace the blank canvas with cached raster tiles (e.g. Stamen, Carto)"
-        " or custom PNGs to avoid live tile requests."
-        "\n2. Overlay NASA rasters (LST, NDVI) using `ImageLayer` once processed."
-        "\n3. Add vector layers for industrial zones, green spaces, and wards."
-        "\n4. Hook the UI to the Python backend endpoint `/api/region?lat=&lon=`."
+        "### About Vegetation Indices"
+        "\n• **NDVI (Normalized Difference Vegetation Index)**: Measures vegetation health and density"
+        "\n• **NDWI (Normalized Difference Water Index)**: Detects water bodies and moisture content"
+        "\n• **NDBI (Normalized Difference Built-up Index)**: Identifies built-up areas and urban development"
+        "\n• **SAVI (Soil-Adjusted Vegetation Index)**: Vegetation index adjusted for soil background"
+        "\n\nData source: Copernicus Sentinel-2 satellite imagery via Google Earth Engine"
     )
 
 
