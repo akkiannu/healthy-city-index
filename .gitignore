@@ -4,3 +4,7 @@ dist/
 frontend/dist/
 .DS_Store
 .env
+data/
+*.tif
+*.tif.aux.xml
+__pycache__/
