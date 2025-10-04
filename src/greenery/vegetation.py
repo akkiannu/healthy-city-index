@@ -40,17 +40,21 @@ image = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
          .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
          .median())
 
-# --- Calculate all three indices ---
+# --- Calculate all four indices ---
 
-# 1. Normalized Difference Water Index (NDWI)
+# 1. Normalized Difference Vegetation Index (NDVI)
+# Formula: (NIR - Red) / (NIR + Red)
+ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
+
+# 2. Normalized Difference Water Index (NDWI)
 # Formula: (Green - NIR) / (Green + NIR)
 ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI')
 
-# 2. Normalized Difference Built-up Index (NDBI)
+# 3. Normalized Difference Built-up Index (NDBI)
 # Formula: (SWIR1 - NIR) / (SWIR1 + NIR)
 ndbi = image.normalizedDifference(['B11', 'B8']).rename('NDBI')
 
-# 3. Soil-Adjusted Vegetation Index (SAVI)
+# 4. Soil-Adjusted Vegetation Index (SAVI)
 # Formula: ((NIR - Red) / (NIR + Red + L)) * (1 + L), where L=0.5
 savi = image.expression(
     '1.5 * (NIR - RED) / (NIR + RED + 0.5)', {
@@ -60,7 +64,7 @@ savi = image.expression(
 
 # --- Combine all index bands into one image ---
 # This is more efficient than calculating statistics for each one separately.
-final_image = ndwi.addBands(ndbi).addBands(savi)
+final_image = ndvi.addBands(ndwi).addBands(ndbi).addBands(savi)
 
 # --- Calculate the average value for all indices within the AOI ---
 # We use a single reduceRegion call with a mean() reducer.
@@ -75,7 +79,7 @@ results = stats.getInfo()
 
 print("--- Index Results for the Selected Area ---")
 # The '.get' method is used to safely access the dictionary keys
-print(f"The average NDVI for the selected area is: {result.get('NDVI', 'N/A'):.4f}")
+print(f"🌿 Average Normalized Difference Vegetation Index (NDVI): {results.get('NDVI', 'N/A'):.4f}")
 print(f"💧 Average Normalized Difference Water Index (NDWI): {results.get('NDWI', 'N/A'):.4f}")
 print(f"🏙️  Average Normalized Difference Built-up Index (NDBI): {results.get('NDBI', 'N/A'):.4f}")
 print(f"🌱 Average Soil-Adjusted Vegetation Index (SAVI): {results.get('SAVI', 'N/A'):.4f}")
