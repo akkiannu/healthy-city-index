@@ -10,13 +10,15 @@ custom vector layers once NASA data products are ready.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Dict, Tuple
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import pydeck as pdk
+import rasterio
 import streamlit as st
 
 
@@ -50,14 +52,65 @@ DEFAULT_REGION = RegionData(
 )
 
 
+def _normalize_path(path: str) -> Optional[str]:
+    if not path:
+        return None
+    expanded = Path(path).expanduser()
+    try:
+        resolved = expanded.resolve(strict=False)
+    except FileNotFoundError:
+        return None
+    return str(resolved)
+
+
+@st.cache_resource(show_spinner=False)
+def _load_population_raster(path: str):
+    return rasterio.open(path)
+
+
+@st.cache_data(show_spinner=False)
+def _sample_population_density(path: str, lat: float, lon: float) -> Optional[float]:
+    dataset = _load_population_raster(path)
+    try:
+        sample = next(dataset.sample([(lon, lat)]))[0]
+    except StopIteration:
+        return None
+    except Exception:
+        raise
+    if dataset.nodata is not None and sample == dataset.nodata:
+        return None
+    if np.isnan(sample):
+        return None
+    return float(sample)
+
+
+def _population_density_from_path(
+    path: str, lat: float, lon: float
+) -> Tuple[Optional[float], Optional[str]]:
+    normalized = _normalize_path(path)
+    if not normalized or not Path(normalized).exists():
+        return None, "Population raster not found at the provided path."
+    try:
+        value = _sample_population_density(normalized, lat, lon)
+    except Exception as exc:
+        return None, f"Failed to sample raster: {exc}"
+    if value is None:
+        return None, "Raster returned no data at this location."
+    return value, None
+
+
 def _noise(lat: float, lon: float, seed: int) -> float:
     return abs(math.sin(lat * 5 + lon * 3 + seed)) % 1.0
 
 
-def fetch_region_data(lat: float, lon: float) -> RegionData:
+def fetch_region_data(
+    lat: float,
+    lon: float,
+    population_density: Optional[float] = None,
+) -> RegionData:
     n = [_noise(lat, lon, i) for i in range(1, 8)]
     try:
-        return RegionData(
+        region = RegionData(
             lat=lat,
             lon=lon,
             air_pm25=round(20 + 80 * n[0], 1),
@@ -68,6 +121,9 @@ def fetch_region_data(lat: float, lon: float) -> RegionData:
             lst_c=round(28 + 10 * n[5], 1),
             industrial_km=round(0.1 + 8.0 * n[6], 2),
         )
+        if population_density is not None:
+            region = replace(region, pop_density=float(population_density))
+        return region
     except Exception:
         return DEFAULT_REGION
 
@@ -166,12 +222,12 @@ def _map_layers(point: Dict[str, float]) -> Tuple[pdk.Deck, Dict[str, float]]:
         latitude=point["lat"], longitude=point["lon"], zoom=11, pitch=0
     )
 
-    # Industrial proxy rectangle around central Mumbai (mock overlay).
+    # Approximate bounding box for Greater Mumbai (covers island city + suburbs).
     rectangle = [
-        [72.82, 19.02],
-        [72.93, 19.02],
-        [72.93, 19.10],
-        [72.82, 19.10],
+        [72.76, 18.89],
+        [73.04, 18.89],
+        [73.04, 19.33],
+        [72.76, 19.33],
     ]
 
     rectangle_layer = pdk.Layer(
@@ -216,6 +272,23 @@ def _radar_chart(scores: Dict[str, float]) -> go.Figure:
 
 def main() -> None:
     _initialise_session_state()
+
+    st.sidebar.header("Data sources")
+    population_raster_input = st.sidebar.text_input(
+        "WorldPop population raster (*.tif)",
+        value=st.session_state.get("population_raster_path", ""),
+        help=(
+            "Provide the path to a downloaded WorldPop (or similar) GeoTIFF for"
+            " Mumbai. The app samples the raster at the selected coordinate to"
+            " replace the mock population density."
+        ),
+    )
+    st.session_state["population_raster_path"] = population_raster_input
+    population_status_placeholder = st.sidebar.empty()
+    if not population_raster_input:
+        population_status_placeholder.info(
+            "Population density currently uses mock values."
+        )
 
     st.title("🌆 Healthy City Index — Mumbai")
     st.caption("Streamlit port • Mock indicators that mirror the React wireframe")
@@ -266,7 +339,22 @@ def main() -> None:
             )
 
         point = st.session_state.point
-        region = fetch_region_data(point["lat"], point["lon"])
+        population_override = None
+        if population_raster_input:
+            population_value, population_error = _population_density_from_path(
+                population_raster_input, point["lat"], point["lon"]
+            )
+            if population_error:
+                population_status_placeholder.warning(population_error)
+            else:
+                population_override = population_value
+                population_status_placeholder.success(
+                    f"Population raster sample: {population_override:.1f} (raw units)"
+                )
+
+        region = fetch_region_data(
+            point["lat"], point["lon"], population_density=population_override
+        )
         scores = compute_scores(region)
         recs = recommendations(region, scores)
 
@@ -292,10 +380,16 @@ def main() -> None:
             st.metric(label="HCI (0–1, higher better)", value=f"{recs['hci']:.2f}")
             st.plotly_chart(_radar_chart(scores), use_container_width=True)
 
-            st.caption(
-                "⚠️ Mock values for wireframe. Swap `fetch_region_data` with backend"
-                " calls when the Python API is ready."
-            )
+            if population_override is not None:
+                st.caption(
+                    "Population density sourced from the provided raster. Other"
+                    " indicators remain mocked until their data sources are wired."
+                )
+            else:
+                st.caption(
+                    "⚠️ Mock values for wireframe. Swap `fetch_region_data` with"
+                    " backend calls as data sources come online."
+                )
 
     with tab_ai:
         col_left, col_right = st.columns([1.2, 1], gap="large")

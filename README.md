@@ -31,4 +31,6 @@ The `streamlit_app.py` script mirrors the React wireframe using Streamlit, givin
 2. `pip install -r requirements.txt`
 3. `streamlit run streamlit_app.py`
 
+Optional: drop a WorldPop (or similar) population GeoTIFF path into the sidebar field to replace the mock population density with real raster samples. Other indicators remain mocked until their data sources are wired.
+
 The Streamlit UI exposes the same mocked indicators, scoring logic, and recommendations. The current map view uses a blank pydeck canvas with a highlighted industrial rectangle and point marker. See the roadmap at the foot of the app for ideas on layering cached tiles or NASA rasters as we iterate on the mapping experience.
