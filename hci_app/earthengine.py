@@ -7,6 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import pandas as pd
 import streamlit as st
 
 from .constants import ROOT_DIR
@@ -20,6 +21,9 @@ except ImportError:  # pragma: no cover
 DEFAULT_CREDENTIALS_PATH = ROOT_DIR / "credentials.json"
 DEFAULT_DATE_RANGE = ("2024-10-01", "2025-01-01")
 DEFAULT_CLOUD_COVER = 20
+DEFAULT_WATER_DATE_RANGE = ("2024-12-01", "2025-03-01")
+
+
 class EarthEngineUnavailable(RuntimeError):
     """Raised when Google Earth Engine cannot be used."""
 
@@ -252,6 +256,195 @@ def air_quality_indices(
     return _cached_air_quality(north, south, east, west, start_date, end_date, max_cloud, path.resolve())
 
 
+@lru_cache(maxsize=128)
+def _cached_water_pollution(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    start_date: str,
+    end_date: str,
+    max_cloud: int,
+    credentials_path: Path,
+) -> Dict[str, Optional[float]]:
+    status, error = initialise(credentials_path)
+    if not status:
+        raise EarthEngineUnavailable(error or "Earth Engine unavailable")
+
+    aoi = _geometry_from_bounds(north, south, east, west)
+
+    sentinel = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(aoi)
+        .filterDate(start_date, end_date)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", max_cloud))
+        .median()
+    )
+
+    swir_ratio_value: Optional[float] = None
+    try:
+        swir_ratio = sentinel.select("B11").divide(sentinel.select("B12"))
+        swir_ratio_value = swir_ratio.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=aoi, scale=60, bestEffort=True, maxPixels=1_000_000_000
+        ).get("B11")
+        swir_ratio_value = float(swir_ratio_value.getInfo()) if swir_ratio_value is not None else None
+    except Exception:
+        swir_ratio_value = None
+
+    landsat = (
+        ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
+        .merge(ee.ImageCollection("LANDSAT/LC08/C02/T1_L2"))
+        .filterBounds(aoi)
+        .filterDate(start_date, end_date)
+        .filter(ee.Filter.lt("CLOUD_COVER", max_cloud))
+        .median()
+    )
+
+    tir_anomaly_value: Optional[float] = None
+    try:
+        tir = landsat.select("ST_B10").multiply(0.00341802).add(149.0)
+        mean_temp_value = tir.reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=aoi, scale=90, bestEffort=True, maxPixels=1_000_000_000
+        ).get("ST_B10")
+        mean_temp_value = (
+            float(mean_temp_value.getInfo()) if mean_temp_value is not None else None
+        )
+        if mean_temp_value is not None:
+            anomaly = tir.subtract(mean_temp_value)
+            tir_anomaly_value = anomaly.reduceRegion(
+                reducer=ee.Reducer.mean(), geometry=aoi, scale=90, bestEffort=True, maxPixels=1_000_000_000
+            ).get("ST_B10")
+            tir_anomaly_value = (
+                float(tir_anomaly_value.getInfo()) if tir_anomaly_value is not None else None
+            )
+    except Exception:
+        tir_anomaly_value = None
+
+    return {"swir_ratio": swir_ratio_value, "tir_anomaly": tir_anomaly_value}
+
+
+@st.cache_data(show_spinner=False)
+def water_pollution_indices(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    start_date: str = DEFAULT_WATER_DATE_RANGE[0],
+    end_date: str = DEFAULT_WATER_DATE_RANGE[1],
+    max_cloud: int = DEFAULT_CLOUD_COVER,
+    credentials_path: Optional[Path] = None,
+) -> Dict[str, Optional[float]]:
+    path = credentials_path or DEFAULT_CREDENTIALS_PATH
+    return _cached_water_pollution(north, south, east, west, start_date, end_date, max_cloud, path.resolve())
+
+
+@lru_cache(maxsize=32)
+def _cached_water_pollution_map(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    start_date: str,
+    end_date: str,
+    max_cloud: int,
+    credentials_path: Path,
+    scale: int,
+    num_pixels: int,
+) -> Optional[pd.DataFrame]:
+    status, error = initialise(credentials_path)
+    if not status:
+        raise EarthEngineUnavailable(error or "Earth Engine unavailable")
+
+    aoi = _geometry_from_bounds(north, south, east, west)
+    sentinel = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(aoi)
+        .filterDate(start_date, end_date)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", max_cloud))
+        .median()
+    )
+
+    try:
+        swir_ratio = sentinel.select("B11").divide(sentinel.select("B12")).rename("swir_ratio")
+    except Exception:
+        return None
+
+    lonlat = ee.Image.pixelLonLat()
+    sample_image = swir_ratio.addBands(lonlat)
+
+    try:
+        samples = sample_image.sample(
+            region=aoi,
+            scale=scale,
+            projection="EPSG:4326",
+            numPixels=num_pixels,
+            geometries=True,
+            tileScale=4,
+        )
+        features = samples.getInfo().get("features", [])
+    except Exception:
+        return None
+
+    if not features:
+        return None
+
+    records = []
+    for feature in features:
+        props = feature.get("properties", {})
+        geometry = feature.get("geometry", {})
+        coords = geometry.get("coordinates")
+        value = props.get("swir_ratio")
+        if coords is None or value is None:
+            continue
+        try:
+            lon_val, lat_val = float(coords[0]), float(coords[1])
+            records.append({"lon": lon_val, "lat": lat_val, "value": float(value)})
+        except (TypeError, ValueError):
+            continue
+
+    if not records:
+        return None
+
+    return pd.DataFrame(records)
+
+
+@st.cache_data(show_spinner=False)
+def water_pollution_heatmap(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    start_date: str = DEFAULT_WATER_DATE_RANGE[0],
+    end_date: str = DEFAULT_WATER_DATE_RANGE[1],
+    max_cloud: int = DEFAULT_CLOUD_COVER,
+    credentials_path: Optional[Path] = None,
+    scale: int = 300,
+    num_pixels: int = 4000,
+) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    path = credentials_path or DEFAULT_CREDENTIALS_PATH
+    try:
+        dataframe = _cached_water_pollution_map(
+            north,
+            south,
+            east,
+            west,
+            start_date,
+            end_date,
+            max_cloud,
+            path.resolve(),
+            scale,
+            num_pixels,
+        )
+    except EarthEngineUnavailable as exc:
+        return None, str(exc)
+    except Exception as exc:  # pragma: no cover - network dependent
+        return None, str(exc)
+
+    if dataframe is None or dataframe.empty:
+        return None, "Water pollution dataset returned no samples."
+    return dataframe, None
+
+
 __all__ = [
     "EarthEngineUnavailable",
     "DEFAULT_CREDENTIALS_PATH",
@@ -261,4 +454,6 @@ __all__ = [
     "is_available",
     "vegetation_indices",
     "air_quality_indices",
+    "water_pollution_indices",
+    "water_pollution_heatmap",
 ]

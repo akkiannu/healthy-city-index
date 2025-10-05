@@ -13,7 +13,7 @@ DEFAULT_POP_DENSITY_RASTER = DATA_DIR / "ind_pd_2020_1km_UNadj.tif"
 DEFAULT_POP_TOTAL_RASTER = DATA_DIR / "ind_pop_2025_CN_1km_R2025A_UA_v1.tif"
 
 TREECOVER_DIR = DATA_DIR / "treecover"
-TREECOVER_CANDIDATES = ["10N_070E.tif", "20N_070E.tif", "30N_070E.tif"]
+TREECOVER_CANDIDATES = ["20N_070E.tif"]
 
 
 def _default_treecover_raster() -> Optional[Path]:
@@ -49,6 +49,7 @@ HEATMAP_COLOR_SCHEMES = {
             [222, 45, 38],
             [165, 15, 21],
         ],
+        "legend": "Lower (light) = fewer people/km² · Higher (dark) = denser neighborhoods",
     },
     "Population total": {
         "colors": [
@@ -60,6 +61,7 @@ HEATMAP_COLOR_SCHEMES = {
             [106, 81, 163],
             [74, 20, 134],
         ],
+        "legend": "Lower (light) = fewer residents · Higher (dark) = denser catchments",
     },
     "Tree cover": {
         "colors": [
@@ -71,6 +73,19 @@ HEATMAP_COLOR_SCHEMES = {
             [35, 139, 69],
             [0, 90, 50],
         ],
+        "legend": "Lower (light) = sparse canopy · Higher (dark) = richer tree cover",
+    },
+    "Water pollution": {
+        "colors": [
+            [30, 64, 175],
+            [37, 99, 235],
+            [59, 130, 246],
+            [147, 197, 253],
+            [250, 204, 21],
+            [248, 113, 113],
+            [220, 38, 38],
+        ],
+        "legend": "Lower (blue) = clearer water · Higher (red) = potential pollution",
     },
 }
 

@@ -17,6 +17,7 @@ class RegionData:
     air_no2: float  # µmol/m² column
     air_co: float  # µmol/m² column
     air_co2: float  # ppm
+    water_pollution: float
     ndvi: float
     ndwi: float
     ndbi: float
@@ -33,6 +34,7 @@ DEFAULT_REGION = RegionData(
     air_no2=320.0,
     air_co=180.0,
     air_co2=420.0,
+    water_pollution=1.05,
     ndvi=0.40,
     ndwi=0.32,
     ndbi=0.28,
@@ -62,6 +64,7 @@ def fetch_region_data(
     population_density: Optional[float] = None,
     vegetation_indices: Optional[Dict[str, Optional[float]]] = None,
     air_quality: Optional[Dict[str, Optional[float]]] = None,
+    water_quality: Optional[Dict[str, Optional[float]]] = None,
 ) -> RegionData:
     """Return mock indicator values for a given coordinate."""
 
@@ -85,6 +88,12 @@ def fetch_region_data(
     }
     if air_quality:
         air = {key: _coerce(air_quality.get(key), air[key]) for key in air}
+
+    water = {"pollution": round(0.95 + 0.25 * noise_values[2], 3)}
+    if water_quality:
+        value = water_quality.get("swir_ratio")
+        if value is not None:
+            water["pollution"] = _coerce(value, water["pollution"])
     try:
         region = RegionData(
             lat=lat,
@@ -93,6 +102,7 @@ def fetch_region_data(
             air_no2=air["no2"],
             air_co=air["co"],
             air_co2=air["co2"],
+            water_pollution=water["pollution"],
             ndvi=vegetation["ndvi"],
             ndwi=vegetation["ndwi"],
             ndbi=vegetation["ndbi"],

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -11,7 +10,6 @@ import pandas as pd
 import pydeck as pdk
 
 from .constants import DEFAULT_HEATMAP_COLORS, MUMBAI_BOUNDS
-from .raster import normalize_path
 
 
 def _generate_click_grid(
@@ -57,39 +55,14 @@ def prepare_heatmap_dataframe(
     return dataframe, vmin, vmax
 
 
-def basemap_layer(
-    image_path: str,
-    bounds: Tuple[float, float, float, float],
-    opacity: float = 1.0,
-) -> Optional[pdk.Layer]:
-    normalized = normalize_path(image_path)
-    if not normalized or not Path(normalized).exists():
-        return None
-    west, south, east, north = bounds
-    rectangle = [
-        [west, south],
-        [east, south],
-        [east, north],
-        [west, north],
-    ]
-    return pdk.Layer(
-        "BitmapLayer",
-        data=None,
-        id="basemap",
-        image=str(normalized),
-        bounds=rectangle,
-        opacity=float(opacity),
-    )
-
-
 def map_layers(
     point: Dict[str, float],
     heatmap_df: Optional[pd.DataFrame] = None,
     heatmap_label: str = "",
     heatmap_units: str = "",
     heatmap_color_range: Optional[list[list[int]]] = None,
-    basemap_image: Optional[str] = None,
-    basemap_opacity: float = 1.0,
+    basemap_tile_url: Optional[str] = None,
+    heatmap_opacity: float = 0.75,
 ) -> Tuple[pdk.Deck, Dict[str, float]]:
     view_state = pdk.ViewState(
         latitude=point["lat"], longitude=point["lon"], zoom=11, pitch=0
@@ -128,10 +101,18 @@ def map_layers(
 
     layers = [rectangle_layer, grid_layer]
 
-    if basemap_image:
-        base_layer = basemap_layer(basemap_image, MUMBAI_BOUNDS, opacity=basemap_opacity)
-        if base_layer:
-            layers.insert(0, base_layer)
+    if basemap_tile_url:
+        base_layer = pdk.Layer(
+            "TileLayer",
+            data=basemap_tile_url,
+            id="base-map",
+            min_zoom=0,
+            max_zoom=19,
+            tile_size=256,
+            opacity=1.0,
+            pickable=False,
+        )
+        layers.insert(0, base_layer)
 
     tooltip_html = "<b>Lat:</b> {lat}<br/><b>Lon:</b> {lon}"
     tooltip_style = {"backgroundColor": "#0f172a", "color": "#f8fafc"}
@@ -146,6 +127,7 @@ def map_layers(
             radius_pixels=60,
             aggregation="MEAN",
             color_range=heatmap_color_range,
+            opacity=max(0.0, min(1.0, heatmap_opacity)),
             pickable=False,
         )
         layers.append(heatmap_layer)
@@ -236,7 +218,6 @@ def selection_to_point(selection: Optional[Dict[str, Any]]) -> Optional[Tuple[fl
 
 __all__ = [
     "MAP_CLICK_GRID",
-    "basemap_layer",
     "prepare_heatmap_dataframe",
     "map_layers",
     "selection_to_point",

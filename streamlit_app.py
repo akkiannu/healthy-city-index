@@ -29,6 +29,8 @@ from hci_app.earthengine import (
     DEFAULT_CREDENTIALS_PATH,
     EarthEngineUnavailable,
     vegetation_indices as gee_vegetation_indices,
+    water_pollution_heatmap as gee_water_pollution_heatmap,
+    water_pollution_indices as gee_water_pollution,
 )
 from hci_app.maps import map_layers, prepare_heatmap_dataframe, selection_to_point
 from hci_app.models import fetch_region_data
@@ -39,13 +41,42 @@ from hci_app.scoring import clamp_value, compute_scores, recommendations
 st.set_page_config(page_title="Healthy City Index — Mumbai", layout="wide")
 
 
+METRIC_IMPACTS: Dict[str, str] = {
+    "PM2.5": "Fine particulates drive respiratory risk and spotlight emission-control needs.",
+    "NO₂ (column)": "Reactive nitrogen traces traffic pressure and street ventilation gaps.",
+    "CO (column)": "Carbon monoxide reveals incomplete combustion hotspots for transit or fuel fixes.",
+    "CO₂": "Local carbon load signals where efficiency retrofits and clean power matter most.",
+    "Water pollution (SWIR ratio)": "High ratios hint at turbid or polluted waters needing remediation.",
+    "NDVI": "Vegetation coverage guides cooling corridors and nature-based infrastructure sites.",
+    "NDWI": "Surface moisture marks wetlands or flood buffers to safeguard.",
+    "NDBI": "Built-up intensity shows hardscape concentration for balancing land use.",
+    "SAVI": "Vegetation health flags parks needing irrigation or soil rehabilitation.",
+    "Population density": "Where residents cluster, services and evacuation plans must scale.",
+    "Population (est.)": "Total headcount informs school, health, and mobility capacity planning.",
+    "Tree cover": "Tree canopy cools streetscapes and improves air—priority zones for preservation.",
+    "Land surface temp": "Hot surfaces expose heat islands requiring shade or cool-roof programs.",
+    "Industrial proximity": "Nearby industry demands buffers and compatibility checks in zoning.",
+    "HCI (0–1, higher better)": "Composite livability score to target the weakest planning dimension.",
+    "Composite HCI": "Narrative indicator for briefing leadership on overall urban resilience.",
+    "Latitude": "Anchor coordinate to align zoning and infrastructure overlays.",
+    "Longitude": "Works with latitude to place interventions within cadastral grids.",
+    "LST": "Thermal readings pinpoint microclimate stress needing cooling interventions.",
+}
+
+BASEMAP_TEMPLATES: Dict[str, str] = {
+    "Street view": "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "Satellite view": "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    "Terrain view": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
+}
+
+
 def _initialise_session_state() -> None:
     if "point" not in st.session_state:
         st.session_state.point = DEFAULT_POINT.copy()
 
 
 def _radar_chart(scores: Dict[str, float]) -> go.Figure:
-    categories = ["Air", "Green", "Population", "Temperature", "Industrial"]
+    categories = ["Air", "Water", "Green", "Population", "Temperature", "Industrial"]
     values = [round(scores[key.lower()], 3) * 100 for key in categories]
     return go.Figure(
         data=go.Scatterpolar(
@@ -56,6 +87,60 @@ def _radar_chart(scores: Dict[str, float]) -> go.Figure:
         showlegend=False,
         margin=dict(l=20, r=20, t=20, b=20),
     )
+
+
+def _heatmap_legend_html(
+    name: str, colors: list[list[int]], legend_text: Optional[str]
+) -> Optional[str]:
+    if not colors:
+        return None
+    stops = []
+    total = max(len(colors) - 1, 1)
+    for idx, (r, g, b) in enumerate(colors):
+        percent = idx / total * 100
+        stops.append(f"#{r:02x}{g:02x}{b:02x} {percent:.0f}%")
+
+    low_label = "Low"
+    high_label = "High"
+    if legend_text:
+        parts = [part.strip() for part in legend_text.split("·")]
+        if parts:
+            low_label = parts[0]
+            if len(parts) > 1:
+                high_label = parts[1]
+
+    gradient = ", ".join(stops)
+    return f"""
+<style>
+.hci-legend {{
+  display: flex;
+  align-items: center;
+  font-size: 0.7rem;
+  gap: 0.75rem;
+  margin-top: 0.35rem;
+  margin-bottom: 0.5rem;
+}}
+.hci-legend-name {{
+  font-weight: 600;
+}}
+.hci-legend-bar {{
+  flex: 1 1 auto;
+  height: 12px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, {gradient});
+  border: 1px solid rgba(15, 23, 42, 0.08);
+}}
+.hci-legend-text {{
+  line-height: 1;
+}}
+</style>
+<div class="hci-legend">
+  <span class="hci-legend-name">{name}</span>
+  <div class="hci-legend-bar"></div>
+  <span class="hci-legend-text">{low_label}</span>
+  <span class="hci-legend-text">{high_label}</span>
+</div>
+"""
 
 
 def main() -> None:
@@ -122,40 +207,29 @@ def main() -> None:
         treecover_status_placeholder.info("Tree cover overlay not configured.")
 
     st.sidebar.header("Map appearance")
-    st.session_state.setdefault("basemap_image_path", "")
-    st.session_state.setdefault("basemap_opacity", 0.85)
-    basemap_image_input = st.sidebar.text_input(
-        "Basemap image (PNG/JPG)",
-        value=st.session_state["basemap_image_path"],
-        help=(
-            "Path to a cached basemap image covering the Mumbai extent."
-            " The file should be georeferenced to the map bounds and is rendered"
-            " via a PyDeck BitmapLayer."
-        ),
+    default_style = "Street view"
+    basemap_options = list(BASEMAP_TEMPLATES.keys())
+    st.session_state.setdefault("basemap_style", default_style)
+    current_style = st.session_state.get("basemap_style", default_style)
+    basemap_style = st.sidebar.selectbox(
+        "Base map",
+        basemap_options,
+        index=basemap_options.index(current_style) if current_style in basemap_options else 0,
+        help="Switch between street, satellite, or terrain tiles.",
     )
-    basemap_opacity_input = st.sidebar.slider(
-        "Basemap opacity",
+    st.session_state["basemap_style"] = basemap_style
+    basemap_tile_url = BASEMAP_TEMPLATES[basemap_style]
+
+    st.sidebar.subheader("Heatmap controls")
+    st.session_state.setdefault("heatmap_opacity", 0.75)
+    heatmap_opacity_input = st.sidebar.slider(
+        "Heatmap opacity",
         min_value=0.0,
         max_value=1.0,
-        value=float(st.session_state["basemap_opacity"]),
+        value=float(st.session_state["heatmap_opacity"]),
         step=0.05,
     )
-    st.session_state["basemap_image_path"] = basemap_image_input
-    st.session_state["basemap_opacity"] = basemap_opacity_input
-
-    basemap_status_placeholder = st.sidebar.empty()
-    basemap_path: Optional[str] = None
-    if basemap_image_input:
-        normalized_basemap = normalize_path(basemap_image_input)
-        if not normalized_basemap or not Path(normalized_basemap).exists():
-            basemap_status_placeholder.warning(
-                "Basemap image not found. Provide a PNG or JPG accessible to this app."
-            )
-        else:
-            basemap_path = normalized_basemap
-            basemap_status_placeholder.success("Basemap ready — rendered beneath overlays.")
-    else:
-        basemap_status_placeholder.info("Basemap not configured; map keeps the blank canvas.")
+    st.session_state["heatmap_opacity"] = heatmap_opacity_input
 
     st.sidebar.header("Remote data")
     st.session_state.setdefault("use_gee", False)
@@ -182,7 +256,13 @@ def main() -> None:
                 "Earth Engine credentials not found; vegetation metrics will use mock values."
             )
 
-    heatmap_options = ["None", "Population density", "Population total", "Tree cover"]
+    heatmap_options = [
+        "None",
+        "Population density",
+        "Population total",
+        "Tree cover",
+        "Water pollution",
+    ]
     default_heatmap_index = 0
     if population_raster_input:
         default_heatmap_index = 1
@@ -255,6 +335,8 @@ def main() -> None:
             heatmap_caption = None
             heatmap_error_message = None
             heatmap_color_range: Optional[list[list[int]]] = None
+            heatmap_colors: Optional[list[list[int]]] = None
+            heatmap_legend: Optional[str] = None
 
             if heatmap_choice == "Population density":
                 if population_raster_input:
@@ -265,6 +347,9 @@ def main() -> None:
                         heatmap_colors = HEATMAP_COLOR_SCHEMES["Population density"][
                             "colors"
                         ]
+                        heatmap_legend = HEATMAP_COLOR_SCHEMES["Population density"].get(
+                            "legend"
+                        )
                         heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
                             heatmap_df_raw, colors=heatmap_colors
                         )
@@ -289,6 +374,9 @@ def main() -> None:
                         heatmap_colors = HEATMAP_COLOR_SCHEMES["Population total"][
                             "colors"
                         ]
+                        heatmap_legend = HEATMAP_COLOR_SCHEMES["Population total"].get(
+                            "legend"
+                        )
                         heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
                             heatmap_df_raw, colors=heatmap_colors
                         )
@@ -311,6 +399,9 @@ def main() -> None:
                     )
                     if heatmap_df_raw is not None:
                         heatmap_colors = HEATMAP_COLOR_SCHEMES["Tree cover"]["colors"]
+                        heatmap_legend = HEATMAP_COLOR_SCHEMES["Tree cover"].get(
+                            "legend"
+                        )
                         heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
                             heatmap_df_raw, colors=heatmap_colors
                         )
@@ -326,6 +417,35 @@ def main() -> None:
                         heatmap_error_message = None
                 else:
                     heatmap_error_message = "Tree cover raster not configured."
+            elif heatmap_choice == "Water pollution":
+                if use_gee and gee_credentials_resolved is not None:
+                    heatmap_df_raw, heatmap_error_message = gee_water_pollution_heatmap(
+                        MUMBAI_BOUNDS[3],
+                        MUMBAI_BOUNDS[1],
+                        MUMBAI_BOUNDS[2],
+                        MUMBAI_BOUNDS[0],
+                        credentials_path=gee_credentials_resolved,
+                    )
+                    if heatmap_df_raw is not None:
+                        heatmap_colors = HEATMAP_COLOR_SCHEMES["Water pollution"]["colors"]
+                        heatmap_legend = HEATMAP_COLOR_SCHEMES["Water pollution"].get("legend")
+                        heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
+                            heatmap_df_raw, colors=heatmap_colors
+                        )
+                        heatmap_df_map["value_display"] = heatmap_df_map["value"].map(
+                            lambda v: f"{v:.2f}"
+                        )
+                        heatmap_label = "Water pollution"
+                        heatmap_units = "SWIR ratio"
+                        heatmap_color_range = heatmap_colors
+                        heatmap_caption = (
+                            f"{heatmap_label} index ≈ {vmin:.2f} – {vmax:.2f}"
+                        )
+                        heatmap_error_message = None
+                else:
+                    heatmap_error_message = (
+                        "Water pollution heatmap requires Earth Engine credentials."
+                    )
 
             map_deck, _ = map_layers(
                 point,
@@ -333,8 +453,8 @@ def main() -> None:
                 heatmap_label=heatmap_label,
                 heatmap_units=heatmap_units,
                 heatmap_color_range=heatmap_color_range,
-                basemap_image=basemap_path,
-                basemap_opacity=basemap_opacity_input,
+                basemap_tile_url=basemap_tile_url,
+                heatmap_opacity=heatmap_opacity_input,
             )
             selection_state = st.pydeck_chart(
                 map_deck,
@@ -365,11 +485,6 @@ def main() -> None:
                     )
                     if rerun_fn:
                         rerun_fn()
-            st.info(
-                "This draft uses a blank pydeck canvas. Next iterations can add cached"
-                " tiles or NASA vector overlays once data is prepared.",
-                icon="ℹ️",
-            )
             st.caption(
                 "Tip: Click the map to move the analysis point — the metrics update automatically."
             )
@@ -377,11 +492,20 @@ def main() -> None:
                 st.warning(heatmap_error_message)
             elif heatmap_caption:
                 st.caption(heatmap_caption)
+                if heatmap_legend:
+                    legend_html = _heatmap_legend_html(
+                        heatmap_label or heatmap_choice,
+                        heatmap_colors or [],
+                        heatmap_legend,
+                    )
+                    if legend_html:
+                        st.markdown(legend_html, unsafe_allow_html=True)
 
         population_override = None
         population_total_override = None
         treecover_override = None
         vegetation_override = None
+        water_quality_override: Optional[Dict[str, Optional[float]]] = None
         air_quality_override: Optional[Dict[str, Optional[float]]] = None
 
         if use_gee and gee_credentials_resolved is not None:
@@ -400,6 +524,22 @@ def main() -> None:
                     vegetation_status.warning(f"⚠️ Earth Engine unavailable: {exc}")
                 except Exception as exc:  # pragma: no cover - network dependent
                     vegetation_status.warning(f"⚠️ Vegetation analysis failed: {exc}")
+
+            water_status = st.empty()
+            with st.spinner("🌊 Fetching water-quality proxies via Earth Engine..."):
+                try:
+                    water_quality_override = gee_water_pollution(
+                        bounding_box["north"],
+                        bounding_box["south"],
+                        bounding_box["east"],
+                        bounding_box["west"],
+                        credentials_path=gee_credentials_resolved,
+                    )
+                    water_status.success("✅ Water pollution proxies from Sentinel/Landsat ready.")
+                except EarthEngineUnavailable as exc:
+                    water_status.warning(f"⚠️ Earth Engine unavailable for water metrics: {exc}")
+                except Exception as exc:  # pragma: no cover - network dependent
+                    water_status.warning(f"⚠️ Water-quality fetch failed: {exc}")
 
         air_status = st.empty()
         with st.spinner("🌬️ Gathering local air-quality metrics..."):
@@ -451,6 +591,7 @@ def main() -> None:
             population_density=population_override,
             vegetation_indices=vegetation_override,
             air_quality=air_quality_override,
+            water_quality=water_quality_override,
         )
         scores = compute_scores(region)
         recs = recommendations(region, scores)
@@ -466,6 +607,7 @@ def main() -> None:
         population_real = population_override is not None
         population_total_real = population_total_override is not None
         treecover_real = treecover_override is not None
+        water_real = bool(water_quality_override and water_quality_override.get("swir_ratio") is not None)
 
         with col_metrics:
             st.subheader(
@@ -477,6 +619,7 @@ def main() -> None:
                 ("NO₂ (column)", f"{region.air_no2:.1f} µmol/m²", air_real.get("no2", False)),
                 ("CO (column)", f"{region.air_co:.1f} µmol/m²", air_real.get("co", False)),
                 ("CO₂", f"{region.air_co2:.1f} ppm", air_real.get("co2", False)),
+                ("Water pollution (SWIR ratio)", f"{region.water_pollution:.2f}", water_real),
                 ("NDVI", f"{region.ndvi:.2f}", vegetation_real.get("ndvi", False)),
                 ("NDWI", f"{region.ndwi:.2f}", vegetation_real.get("ndwi", False)),
                 ("NDBI", f"{region.ndbi:.2f}", vegetation_real.get("ndbi", False)),
@@ -496,14 +639,26 @@ def main() -> None:
                 if not is_real:
                     mock_tracker["used"] = True
                 st.metric(label=display_label, value=value)
+                info = METRIC_IMPACTS.get(label)
+                if info:
+                    st.caption(info)
 
             if population_total_override is not None:
                 st.metric("Population (est.)", f"{population_total_override:,.0f} people")
+                info = METRIC_IMPACTS.get("Population (est.)")
+                if info:
+                    st.caption(info)
             if treecover_override is not None:
                 st.metric("Tree cover", f"{treecover_override:,.1f}%")
+                info = METRIC_IMPACTS.get("Tree cover")
+                if info:
+                    st.caption(info)
 
             st.markdown("### Composite HCI")
             st.metric(label="HCI (0–1, higher better)", value=f"{recs['hci']:.2f}")
+            info = METRIC_IMPACTS.get("HCI (0–1, higher better)")
+            if info:
+                st.caption(info)
             st.plotly_chart(_radar_chart(scores), use_container_width=True)
 
             if (
@@ -562,6 +717,7 @@ def main() -> None:
                 ("NO₂ (column)", f"{region.air_no2:.1f} µmol/m²", air_real.get("no2", False)),
                 ("CO (column)", f"{region.air_co:.1f} µmol/m²", air_real.get("co", False)),
                 ("CO₂", f"{region.air_co2:.1f} ppm", air_real.get("co2", False)),
+                ("Water pollution (SWIR ratio)", f"{region.water_pollution:.2f}", water_real),
                 ("NDVI", f"{region.ndvi:.3f}", vegetation_real.get("ndvi", False)),
                 ("NDWI", f"{region.ndwi:.3f}", vegetation_real.get("ndwi", False)),
                 ("NDBI", f"{region.ndbi:.3f}", vegetation_real.get("ndbi", False)),
@@ -572,9 +728,15 @@ def main() -> None:
                 if not is_real:
                     mock_tracker["used"] = True
                 st.metric(display_label, value)
+                info = METRIC_IMPACTS.get(label)
+                if info:
+                    st.caption(info)
 
         with col_right:
             st.metric("Composite HCI", f"{recs['hci']:.2f}")
+            info = METRIC_IMPACTS.get("Composite HCI")
+            if info:
+                st.caption(info)
             st.write("**Habitability:**", recs["habitability"])
             st.write("**Parks / Greenery:**", recs["parks"])
             st.write("**Waste Management:**", recs["waste"])
