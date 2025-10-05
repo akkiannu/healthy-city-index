@@ -8,3 +8,4 @@ data/
 *.tif
 *.tif.aux.xml
 __pycache__/
+credentials.json

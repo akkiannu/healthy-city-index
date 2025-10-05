@@ -9,6 +9,7 @@ custom vector layers once NASA data products are ready.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, Optional
 
 import pandas as pd
@@ -23,9 +24,15 @@ from hci_app.constants import (
     HEATMAP_COLOR_SCHEMES,
     MUMBAI_BOUNDS,
 )
+from hci_app.airquality import fetch_air_quality
+from hci_app.earthengine import (
+    DEFAULT_CREDENTIALS_PATH,
+    EarthEngineUnavailable,
+    vegetation_indices as gee_vegetation_indices,
+)
 from hci_app.maps import map_layers, prepare_heatmap_dataframe, selection_to_point
 from hci_app.models import fetch_region_data
-from hci_app.raster import raster_dataframe, raster_value_from_path
+from hci_app.raster import normalize_path, raster_dataframe, raster_value_from_path
 from hci_app.scoring import clamp_value, compute_scores, recommendations
 
 
@@ -38,7 +45,7 @@ def _initialise_session_state() -> None:
 
 
 def _radar_chart(scores: Dict[str, float]) -> go.Figure:
-    categories = ["Air", "Water", "Green", "Population", "Temperature", "Industrial"]
+    categories = ["Air", "Green", "Population", "Temperature", "Industrial"]
     values = [round(scores[key.lower()], 3) * 100 for key in categories]
     return go.Figure(
         data=go.Scatterpolar(
@@ -114,6 +121,67 @@ def main() -> None:
     if not treecover_input:
         treecover_status_placeholder.info("Tree cover overlay not configured.")
 
+    st.sidebar.header("Map appearance")
+    st.session_state.setdefault("basemap_image_path", "")
+    st.session_state.setdefault("basemap_opacity", 0.85)
+    basemap_image_input = st.sidebar.text_input(
+        "Basemap image (PNG/JPG)",
+        value=st.session_state["basemap_image_path"],
+        help=(
+            "Path to a cached basemap image covering the Mumbai extent."
+            " The file should be georeferenced to the map bounds and is rendered"
+            " via a PyDeck BitmapLayer."
+        ),
+    )
+    basemap_opacity_input = st.sidebar.slider(
+        "Basemap opacity",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(st.session_state["basemap_opacity"]),
+        step=0.05,
+    )
+    st.session_state["basemap_image_path"] = basemap_image_input
+    st.session_state["basemap_opacity"] = basemap_opacity_input
+
+    basemap_status_placeholder = st.sidebar.empty()
+    basemap_path: Optional[str] = None
+    if basemap_image_input:
+        normalized_basemap = normalize_path(basemap_image_input)
+        if not normalized_basemap or not Path(normalized_basemap).exists():
+            basemap_status_placeholder.warning(
+                "Basemap image not found. Provide a PNG or JPG accessible to this app."
+            )
+        else:
+            basemap_path = normalized_basemap
+            basemap_status_placeholder.success("Basemap ready — rendered beneath overlays.")
+    else:
+        basemap_status_placeholder.info("Basemap not configured; map keeps the blank canvas.")
+
+    st.sidebar.header("Remote data")
+    st.session_state.setdefault("use_gee", False)
+    st.session_state.setdefault("gee_credentials_path", str(DEFAULT_CREDENTIALS_PATH))
+    use_gee = st.sidebar.checkbox(
+        "Use Google Earth Engine vegetation indices",
+        value=st.session_state["use_gee"],
+        help="Fetch NDVI/NDWI/NDBI/SAVI from Sentinel-2 via Google Earth Engine.",
+    )
+    st.session_state["use_gee"] = use_gee
+    gee_credentials_input = st.sidebar.text_input(
+        "Earth Engine credentials JSON",
+        value=st.session_state["gee_credentials_path"],
+        help="Path to the service-account JSON used for Earth Engine authentication.",
+    )
+    st.session_state["gee_credentials_path"] = gee_credentials_input
+    gee_credentials_resolved: Optional[Path] = None
+    if gee_credentials_input:
+        candidate = Path(gee_credentials_input).expanduser()
+        if candidate.exists():
+            gee_credentials_resolved = candidate
+        elif use_gee:
+            st.sidebar.warning(
+                "Earth Engine credentials not found; vegetation metrics will use mock values."
+            )
+
     heatmap_options = ["None", "Population density", "Population total", "Tree cover"]
     default_heatmap_index = 0
     if population_raster_input:
@@ -140,9 +208,19 @@ def main() -> None:
 
     tab_map, tab_ai = st.tabs(["🗺️ Map Explorer", "🧠 AI Recommendations"])
 
+    mock_tracker = {"used": False}
+
     with tab_map:
         point = st.session_state.point
         col_map, col_metrics = st.columns([1.7, 1.3], gap="large")
+
+        rect_size = 0.01
+        bounding_box = {
+            "north": point["lat"] + rect_size,
+            "south": point["lat"] - rect_size,
+            "east": point["lon"] + rect_size,
+            "west": point["lon"] - rect_size,
+        }
 
         with col_map:
             st.subheader("Pick a location")
@@ -255,6 +333,8 @@ def main() -> None:
                 heatmap_label=heatmap_label,
                 heatmap_units=heatmap_units,
                 heatmap_color_range=heatmap_color_range,
+                basemap_image=basemap_path,
+                basemap_opacity=basemap_opacity_input,
             )
             selection_state = st.pydeck_chart(
                 map_deck,
@@ -301,6 +381,35 @@ def main() -> None:
         population_override = None
         population_total_override = None
         treecover_override = None
+        vegetation_override = None
+        air_quality_override: Optional[Dict[str, Optional[float]]] = None
+
+        if use_gee and gee_credentials_resolved is not None:
+            vegetation_status = st.empty()
+            with st.spinner("🌱 Analyzing vegetation indices via Earth Engine..."):
+                try:
+                    vegetation_override = gee_vegetation_indices(
+                        bounding_box["north"],
+                        bounding_box["south"],
+                        bounding_box["east"],
+                        bounding_box["west"],
+                        credentials_path=gee_credentials_resolved,
+                    )
+                    vegetation_status.success("✅ Vegetation indices synced from Earth Engine.")
+                except EarthEngineUnavailable as exc:
+                    vegetation_status.warning(f"⚠️ Earth Engine unavailable: {exc}")
+                except Exception as exc:  # pragma: no cover - network dependent
+                    vegetation_status.warning(f"⚠️ Vegetation analysis failed: {exc}")
+
+        air_status = st.empty()
+        with st.spinner("🌬️ Gathering local air-quality metrics..."):
+            air_quality_override = fetch_air_quality(point["lat"], point["lon"])
+        if air_quality_override and any(
+            air_quality_override.get(key) is not None for key in ["pm2_5", "no2", "co"]
+        ):
+            air_status.success("✅ Air-quality indices sourced from Open-Meteo (GEOS-CF).")
+        else:
+            air_status.warning("⚠️ Air-quality service returned no data; using mock values.")
 
         if population_raster_input:
             density_value, density_error = raster_value_from_path(
@@ -337,10 +446,26 @@ def main() -> None:
                 )
 
         region = fetch_region_data(
-            point["lat"], point["lon"], population_density=population_override
+            point["lat"],
+            point["lon"],
+            population_density=population_override,
+            vegetation_indices=vegetation_override,
+            air_quality=air_quality_override,
         )
         scores = compute_scores(region)
         recs = recommendations(region, scores)
+
+        vegetation_real = {
+            key: bool(vegetation_override and vegetation_override.get(key) is not None)
+            for key in ["ndvi", "ndwi", "ndbi", "savi"]
+        }
+        air_real = {
+            key: bool(air_quality_override and air_quality_override.get(key) is not None)
+            for key in ["pm2_5", "no2", "co", "co2"]
+        }
+        population_real = population_override is not None
+        population_total_real = population_total_override is not None
+        treecover_real = treecover_override is not None
 
         with col_metrics:
             st.subheader(
@@ -348,17 +473,29 @@ def main() -> None:
             )
 
             metrics = [
-                ("PM2.5", f"{region.air_pm25:.1f} μg/m³"),
-                ("NO₂", f"{region.air_no2:.1f} μg/m³"),
-                ("Water turbidity", f"{region.water_turbidity:.1f} NTU"),
-                ("NDVI", f"{region.ndvi:.2f}"),
-                ("Population density", f"{region.pop_density:,.0f} /km²"),
-                ("Land surface temp", f"{region.lst_c:.1f} °C"),
-                ("Industrial proximity", f"{region.industrial_km:.2f} km"),
+                ("PM2.5", f"{region.air_pm25:.1f} µg/m³", air_real.get("pm2_5", False)),
+                ("NO₂ (column)", f"{region.air_no2:.1f} µmol/m²", air_real.get("no2", False)),
+                ("CO (column)", f"{region.air_co:.1f} µmol/m²", air_real.get("co", False)),
+                ("CO₂", f"{region.air_co2:.1f} ppm", air_real.get("co2", False)),
+                ("NDVI", f"{region.ndvi:.2f}", vegetation_real.get("ndvi", False)),
+                ("NDWI", f"{region.ndwi:.2f}", vegetation_real.get("ndwi", False)),
+                ("NDBI", f"{region.ndbi:.2f}", vegetation_real.get("ndbi", False)),
+                ("SAVI", f"{region.savi:.2f}", vegetation_real.get("savi", False)),
+                ("Population density", f"{region.pop_density:,.0f} /km²", population_real),
+                ("Land surface temp", f"{region.lst_c:.1f} °C", False),
+                ("Industrial proximity", f"{region.industrial_km:.2f} km", False),
             ]
 
-            for label, value in metrics:
-                st.metric(label=label, value=value)
+            for entry in metrics:
+                if len(entry) == 3:
+                    label, value, is_real = entry
+                else:
+                    label, value = entry
+                    is_real = True
+                display_label = f"{label}{'' if is_real else '*'}"
+                if not is_real:
+                    mock_tracker["used"] = True
+                st.metric(label=display_label, value=value)
 
             if population_total_override is not None:
                 st.metric("Population (est.)", f"{population_total_override:,.0f} people")
@@ -416,12 +553,25 @@ def main() -> None:
 
         with col_left:
             st.subheader("LLM Recommendations (stub)")
-            st.metric("Latitude", f"{region.lat:.5f}")
-            st.metric("Longitude", f"{region.lon:.5f}")
-            st.metric("PM2.5", f"{region.air_pm25} μg/m³")
-            st.metric("LST", f"{region.lst_c} °C")
-            st.metric("Population density", f"{region.pop_density} /km²")
-            st.metric("Water turbidity", f"{region.water_turbidity} NTU")
+            ai_metrics = [
+                ("Latitude", f"{region.lat:.5f}", True),
+                ("Longitude", f"{region.lon:.5f}", True),
+                ("PM2.5", f"{region.air_pm25} μg/m³", air_real.get("pm2_5", False)),
+                ("LST", f"{region.lst_c} °C", False),
+                ("Population density", f"{region.pop_density} /km²", population_real),
+                ("NO₂ (column)", f"{region.air_no2:.1f} µmol/m²", air_real.get("no2", False)),
+                ("CO (column)", f"{region.air_co:.1f} µmol/m²", air_real.get("co", False)),
+                ("CO₂", f"{region.air_co2:.1f} ppm", air_real.get("co2", False)),
+                ("NDVI", f"{region.ndvi:.3f}", vegetation_real.get("ndvi", False)),
+                ("NDWI", f"{region.ndwi:.3f}", vegetation_real.get("ndwi", False)),
+                ("NDBI", f"{region.ndbi:.3f}", vegetation_real.get("ndbi", False)),
+                ("SAVI", f"{region.savi:.3f}", vegetation_real.get("savi", False)),
+            ]
+            for label, value, is_real in ai_metrics:
+                display_label = f"{label}{'' if is_real else '*'}"
+                if not is_real:
+                    mock_tracker["used"] = True
+                st.metric(display_label, value)
 
         with col_right:
             st.metric("Composite HCI", f"{recs['hci']:.2f}")
@@ -435,6 +585,8 @@ def main() -> None:
             )
 
     st.divider()
+    if mock_tracker["used"]:
+        st.caption("* Mock data placeholder while live Earth Engine values are unavailable for the selected area.")
     st.markdown(
         "### Map roadmap"
         "\n1. Replace the blank canvas with cached raster tiles (e.g. Stamen, Carto)"

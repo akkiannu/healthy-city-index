@@ -21,7 +21,6 @@ def compute_scores(data: RegionData) -> Dict[str, float]:
     return {
         "air": 0.5 * _minmax(data.air_pm25, 10, 100, invert=True)
         + 0.5 * _minmax(data.air_no2, 5, 80, invert=True),
-        "water": _minmax(data.water_turbidity, 1, 20, invert=True),
         "green": _minmax(data.ndvi, 0.1, 0.8),
         "population": _minmax(data.pop_density, 1_000, 30_000, invert=True),
         "temperature": _minmax(data.lst_c, 26, 40, invert=True),
@@ -31,12 +30,11 @@ def compute_scores(data: RegionData) -> Dict[str, float]:
 
 def composite(scores: Dict[str, float]) -> float:
     weights = {
-        "air": 0.22,
-        "water": 0.14,
-        "green": 0.18,
-        "population": 0.12,
-        "temperature": 0.20,
-        "industrial": 0.14,
+        "air": 0.26,
+        "green": 0.20,
+        "population": 0.16,
+        "temperature": 0.22,
+        "industrial": 0.16,
     }
     value = sum(scores[key] * weights[key] for key in weights)
     return round(value, 3)
@@ -71,7 +69,6 @@ def recommendations(data: RegionData, scores: Dict[str, float]) -> Dict[str, str
             data.air_pm25 > 60,
             data.lst_c > 34,
             data.pop_density > 20_000,
-            data.water_turbidity > 10,
         ]
     )
     disease = (

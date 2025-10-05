@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.transform import xy
-from rasterio.windows import from_bounds
+from rasterio.windows import Window, from_bounds
 import streamlit as st
 
 from .constants import DATA_DIR
@@ -41,14 +41,57 @@ def sample_raster(path: str, lat: float, lon: float) -> Optional[float]:
     try:
         sample = next(dataset.sample([(lon, lat)]))[0]
     except StopIteration:
-        return None
+        sample = None
     except Exception:
         raise
-    if dataset.nodata is not None and sample == dataset.nodata:
+    if sample is not None:
+        if dataset.nodata is not None and sample == dataset.nodata:
+            sample = None
+        elif np.isnan(sample):
+            sample = None
+    if sample is not None:
+        return float(sample)
+
+    try:
+        row, col = dataset.index(lon, lat)
+    except Exception:
         return None
-    if np.isnan(sample):
+    row_i = int(round(row))
+    col_i = int(round(col))
+    if row_i < 0 or row_i >= dataset.height or col_i < 0 or col_i >= dataset.width:
         return None
-    return float(sample)
+    return _nearest_valid_sample(dataset, row_i, col_i)
+
+
+def _nearest_valid_sample(dataset, row: int, col: int, max_radius: int = 10) -> Optional[float]:
+    height, width = dataset.height, dataset.width
+    for radius in range(1, max_radius + 1):
+        row_start = max(0, row - radius)
+        row_stop = min(height, row + radius + 1)
+        col_start = max(0, col - radius)
+        col_stop = min(width, col + radius + 1)
+        if row_start >= row_stop or col_start >= col_stop:
+            continue
+        window = Window(col_start, row_start, col_stop - col_start, row_stop - row_start)
+        data = dataset.read(1, window=window, masked=True)
+        mask = getattr(data, "mask", None)
+        valid_mask = (~mask) if mask is not None else np.ones_like(data, dtype=bool)
+        if not valid_mask.any():
+            continue
+        valid_rows, valid_cols = np.where(valid_mask)
+        if valid_rows.size == 0:
+            continue
+        global_rows = valid_rows + row_start
+        global_cols = valid_cols + col_start
+        distances = np.hypot(global_rows - row, global_cols - col)
+        idx = int(np.argmin(distances))
+        value = data.data[valid_rows[idx], valid_cols[idx]]
+        if dataset.nodata is not None and value == dataset.nodata:
+            continue
+        if np.isnan(value):
+            continue
+        return float(value)
+    return None
 
 
 def raster_value_from_path(

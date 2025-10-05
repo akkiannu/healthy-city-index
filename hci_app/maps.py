@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -10,10 +11,11 @@ import pandas as pd
 import pydeck as pdk
 
 from .constants import DEFAULT_HEATMAP_COLORS, MUMBAI_BOUNDS
+from .raster import normalize_path
 
 
 def _generate_click_grid(
-    bounds: Tuple[float, float, float, float], step: float = 0.01
+    bounds: Tuple[float, float, float, float], step: float = 0.005
 ) -> pd.DataFrame:
     west, south, east, north = bounds
     lat_values = np.arange(south, north + step, step)
@@ -55,12 +57,39 @@ def prepare_heatmap_dataframe(
     return dataframe, vmin, vmax
 
 
+def basemap_layer(
+    image_path: str,
+    bounds: Tuple[float, float, float, float],
+    opacity: float = 1.0,
+) -> Optional[pdk.Layer]:
+    normalized = normalize_path(image_path)
+    if not normalized or not Path(normalized).exists():
+        return None
+    west, south, east, north = bounds
+    rectangle = [
+        [west, south],
+        [east, south],
+        [east, north],
+        [west, north],
+    ]
+    return pdk.Layer(
+        "BitmapLayer",
+        data=None,
+        id="basemap",
+        image=str(normalized),
+        bounds=rectangle,
+        opacity=float(opacity),
+    )
+
+
 def map_layers(
     point: Dict[str, float],
     heatmap_df: Optional[pd.DataFrame] = None,
     heatmap_label: str = "",
     heatmap_units: str = "",
     heatmap_color_range: Optional[list[list[int]]] = None,
+    basemap_image: Optional[str] = None,
+    basemap_opacity: float = 1.0,
 ) -> Tuple[pdk.Deck, Dict[str, float]]:
     view_state = pdk.ViewState(
         latitude=point["lat"], longitude=point["lon"], zoom=11, pitch=0
@@ -88,14 +117,21 @@ def map_layers(
         data=MAP_CLICK_GRID,
         id="map-click-grid",
         get_position="[lon, lat]",
-        get_radius=90,
-        get_fill_color="[255, 255, 255, 16]",
-        opacity=0.05,
+        get_radius=250,
+        radius_min_pixels=12,
+        radius_max_pixels=48,
+        get_fill_color="[255, 255, 255, 12]",
+        opacity=0.06,
         stroked=False,
         pickable=True,
     )
 
     layers = [rectangle_layer, grid_layer]
+
+    if basemap_image:
+        base_layer = basemap_layer(basemap_image, MUMBAI_BOUNDS, opacity=basemap_opacity)
+        if base_layer:
+            layers.insert(0, base_layer)
 
     tooltip_html = "<b>Lat:</b> {lat}<br/><b>Lon:</b> {lon}"
     tooltip_style = {"backgroundColor": "#0f172a", "color": "#f8fafc"}
@@ -110,23 +146,9 @@ def map_layers(
             radius_pixels=60,
             aggregation="MEAN",
             color_range=heatmap_color_range,
+            pickable=False,
         )
-        hover_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=heatmap_df,
-            id="heatmap-points",
-            get_position="[lon, lat]",
-            get_fill_color="[color_r, color_g, color_b, 120]",
-            get_line_color="[color_r, color_g, color_b, 200]",
-            get_radius=80,
-            pickable=True,
-            auto_highlight=True,
-        )
-        layers.extend([heatmap_layer, hover_layer])
-        if heatmap_label:
-            tooltip_html += f"<br/><b>{heatmap_label}:</b> {{value_display}}"
-            if heatmap_units:
-                tooltip_html += f" {heatmap_units}"
+        layers.append(heatmap_layer)
 
     point_df = pd.DataFrame(
         [
@@ -214,6 +236,7 @@ def selection_to_point(selection: Optional[Dict[str, Any]]) -> Optional[Tuple[fl
 
 __all__ = [
     "MAP_CLICK_GRID",
+    "basemap_layer",
     "prepare_heatmap_dataframe",
     "map_layers",
     "selection_to_point",
