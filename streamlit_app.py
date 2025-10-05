@@ -9,24 +9,13 @@ custom vector layers once NASA data products are ready.
 
 from __future__ import annotations
 
-import datetime
-import io
-import textwrap
-import datetime
-import io
-import textwrap
 from pathlib import Path
 from dataclasses import replace
 from typing import Any, Dict, Optional
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from matplotlib import pyplot as plt
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas
 
 from hci_app.constants import (
     DEFAULT_POINT,
@@ -54,6 +43,8 @@ from hci_app.models import RegionData, fetch_region_data
 from hci_app.raster import raster_dataframe, raster_value_from_path
 from hci_app.scoring import clamp_value, compute_scores, recommendations
 from hci_app.llm import LLMUnavailable, generate_plan
+from hci_app.report import generate_pdf_report, map_snapshot_png, radar_chart_png
+from hci_app.simulator import simulate_urban_scenario
 
 
 st.set_page_config(page_title="Healthy City Index — Mumbai", layout="wide")
@@ -86,9 +77,6 @@ BASEMAP_TEMPLATES: Dict[str, str] = {
     "Satellite view": "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
     "Terrain view": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
 }
-
-
-_PDF_MARGIN = 54  # 0.75 inches
 
 
 def _initialise_session_state() -> None:
@@ -175,291 +163,8 @@ def _heatmap_legend_html(
 """
 
 
-def _simulate_urban_scenario(
-    base_region: RegionData, ndvi_target: float, ndbi_target: float
-) -> RegionData:
-    ndvi_clamped = clamp_value(ndvi_target, 0.0, 0.9)
-    ndbi_clamped = clamp_value(ndbi_target, -0.2, 0.7)
-
-    delta_green = ndvi_clamped - base_region.ndvi
-    delta_built = ndbi_clamped - base_region.ndbi
-
-    lst_sim = clamp_value(base_region.lst_c - 7.0 * delta_green + 5.0 * delta_built, 18.0, 45.0)
-    pm25_sim = clamp_value(base_region.air_pm25 - 30.0 * delta_green + 22.0 * delta_built, 5.0, 200.0)
-    no2_sim = clamp_value(base_region.air_no2 - 170.0 * delta_green + 130.0 * delta_built, 5.0, 500.0)
-    co_sim = clamp_value(base_region.air_co - 95.0 * delta_green + 85.0 * delta_built, 5.0, 500.0)
-    co2_sim = clamp_value(base_region.air_co2 - 18.0 * delta_green + 12.0 * delta_built, 350.0, 520.0)
-    water_sim = clamp_value(
-        base_region.water_pollution - 0.26 * delta_green + 0.18 * delta_built, 0.6, 1.8
-    )
-    ndwi_sim = clamp_value(base_region.ndwi + 0.45 * delta_green - 0.25 * delta_built, -0.4, 1.0)
-    savi_sim = clamp_value(base_region.savi + 0.55 * delta_green - 0.30 * delta_built, -1.0, 1.0)
-
-    return replace(
-        base_region,
-        ndvi=round(ndvi_clamped, 3),
-        ndbi=round(ndbi_clamped, 3),
-        ndwi=round(ndwi_sim, 3),
-        savi=round(savi_sim, 3),
-        lst_c=round(lst_sim, 1),
-        air_pm25=round(pm25_sim, 1),
-        air_no2=round(no2_sim, 1),
-        air_co=round(co_sim, 1),
-        air_co2=round(co2_sim, 1),
-        water_pollution=round(water_sim, 3),
-    )
 
 
-def _radar_chart_png(scores: Dict[str, float], title: str) -> bytes:
-    categories = ["Air", "Water", "Green", "Built"]
-    values = [max(0.0, min(1.0, scores.get(key.lower(), 0.0))) for key in categories]
-    angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
-    values += values[:1]
-    angles += angles[:1]
-
-    fig = plt.figure(figsize=(3.6, 3.6), dpi=150)
-    ax = fig.add_subplot(111, polar=True)
-    ax.plot(angles, values, color="#1d4ed8", linewidth=2)
-    ax.fill(angles, values, color="#3b82f6", alpha=0.25)
-    ax.set_thetagrids(np.degrees(angles[:-1]), categories)
-    ax.set_ylim(0, 1)
-    ax.set_title(title, pad=20, fontsize=12, fontweight="bold")
-    ax.grid(color="#cbd5f5", linestyle="--", linewidth=0.6)
-    fig.tight_layout()
-
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", bbox_inches="tight")
-    plt.close(fig)
-    buffer.seek(0)
-    return buffer.read()
-
-
-def _map_snapshot_png(region: RegionData, scenario_region: RegionData) -> bytes:
-    west, south, east, north = MUMBAI_BOUNDS
-    fig, ax = plt.subplots(figsize=(3.6, 3.6), dpi=150)
-    ax.set_facecolor("#f8fafc")
-    ax.add_patch(
-        plt.Rectangle(
-            (west, south),
-            east - west,
-            north - south,
-            fill=False,
-            linewidth=1.2,
-            edgecolor="#1f2937",
-        )
-    )
-    ax.scatter(
-        [region.lon],
-        [region.lat],
-        s=60,
-        color="#ef4444",
-        label="Selected location",
-        zorder=5,
-    )
-    ax.text(
-        region.lon,
-        region.lat + 0.01,
-        f"NDVI → {scenario_region.ndvi:.2f}\nNDBI → {scenario_region.ndbi:.2f}",
-        fontsize=8,
-        ha="center",
-        va="bottom",
-        bbox=dict(boxstyle="round,pad=0.35", facecolor="#ffffff", alpha=0.9, edgecolor="#94a3b8"),
-    )
-    ax.set_xlim(west, east)
-    ax.set_ylim(south, north)
-    ax.set_xticks(np.linspace(west, east, 4))
-    ax.set_yticks(np.linspace(south, north, 4))
-    ax.tick_params(labelsize=8)
-    ax.set_title("Mumbai focus area", fontsize=12, fontweight="bold")
-    ax.grid(True, linestyle="--", linewidth=0.5, color="#cbd5f5")
-    ax.legend(loc="upper right", fontsize=8)
-    fig.tight_layout()
-
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", bbox_inches="tight")
-    plt.close(fig)
-    buffer.seek(0)
-    return buffer.read()
-
-
-def _render_lines(
-    can: canvas.Canvas,
-    lines: list[str],
-    margin: int,
-    page_height: int,
-    start_y: int,
-    line_height: int,
-) -> int:
-    y = start_y
-    for line in lines:
-        if y < margin + line_height:
-            can.showPage()
-            y = page_height - margin
-        can.drawString(margin, y, line)
-        y -= line_height
-    return y
-
-
-def _generate_pdf_report(
-    region: RegionData,
-    scores: Dict[str, float],
-    recs: Dict[str, str | float],
-    scenario_region: RegionData,
-    scenario_scores: Dict[str, float],
-    scenario_recs: Dict[str, str | float],
-    scenario_hci: float,
-    ai_text: Optional[str],
-    radar_png: Optional[bytes] = None,
-    map_png: Optional[bytes] = None,
-) -> bytes:
-    buffer = io.BytesIO()
-    can = canvas.Canvas(buffer, pagesize=letter)
-    width, height = letter
-    margin = _PDF_MARGIN
-    page_height = int(height)
-    y = page_height - margin
-    line_height = 14
-
-    can.setFont("Helvetica-Bold", 18)
-    can.drawString(margin, y, "Healthy City Scenario Report")
-    can.setLineWidth(1)
-    can.line(margin, y - 4, width - margin, y - 4)
-    y -= 2 * line_height
-    can.setFont("Helvetica", 10)
-    can.drawString(
-        margin,
-        y,
-        f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-    )
-    y -= int(1.5 * line_height)
-
-    can.setFont("Helvetica-Bold", 14)
-    can.drawString(margin, y, "Section 1 · Current Snapshot")
-    y -= line_height
-    can.setLineWidth(0.5)
-    can.line(margin, y, width - margin, y)
-    y -= int(1.2 * line_height)
-    can.setFont("Helvetica", 11)
-    current_lines = [
-        f"Location: {region.lat:.4f}, {region.lon:.4f}",
-        f"Healthy City Index: {recs['hci']:.2f}",
-        u"• Air quality · PM2.5 {region.air_pm25:.1f} µg/m³ · NO₂ {region.air_no2:.1f} µmol/m² · CO₂ {region.air_co2:.1f} ppm",
-        u"• Water quality · SWIR ratio {region.water_pollution:.3f}",
-        u"• Green assets · NDVI {region.ndvi:.3f} · SAVI {region.savi:.3f}",
-        u"• Built intensity · NDBI {region.ndbi:.3f}",
-        u"• Thermal comfort · LST {region.lst_c:.1f} °C",
-        u"• Density · {region.pop_density:,.0f} residents/km²",
-        u"• Habitability · " + str(recs["habitability"]),
-        u"• Parks & shade · " + str(recs["parks"]),
-        u"• Waste systems · " + str(recs["waste"]),
-        u"• Health resilience · " + str(recs["disease"]),
-    ]
-    y = _render_lines(can, current_lines, margin, page_height, y, line_height)
-    y -= line_height
-
-    can.setFont("Helvetica-Bold", 14)
-    can.drawString(margin, y, "Section 2 · AI Strategy & Scenario Insights")
-    y -= line_height
-    can.setLineWidth(0.5)
-    can.line(margin, y, width - margin, y)
-    y -= int(1.2 * line_height)
-    can.setFont("Helvetica", 11)
-    scenario_summary = [
-        "Scenario summary:",
-        u"• Target NDVI: {:.3f} (Δ {:+.3f})".format(
-            scenario_region.ndvi, scenario_region.ndvi - region.ndvi
-        ),
-        u"• Target NDBI: {:.3f} (Δ {:+.3f})".format(
-            scenario_region.ndbi, scenario_region.ndbi - region.ndbi
-        ),
-        u"• Projected LST: {:.1f} °C (Δ {:+.1f})".format(
-            scenario_region.lst_c, scenario_region.lst_c - region.lst_c
-        ),
-        u"• Projected PM2.5: {:.1f} µg/m³ (Δ {:+.1f})".format(
-            scenario_region.air_pm25, scenario_region.air_pm25 - region.air_pm25
-        ),
-        u"• Projected water ratio: {:.3f} (Δ {:+.3f})".format(
-            scenario_region.water_pollution,
-            scenario_region.water_pollution - region.water_pollution,
-        ),
-        u"• Projected HCI: {:.2f} (Δ {:+.2f})".format(
-            scenario_hci, scenario_hci - recs["hci"]
-        ),
-    ]
-    y = _render_lines(can, scenario_summary, margin, page_height, y, line_height)
-    y -= line_height
-
-    can.setFont("Helvetica", 11)
-    ai_lines: list[str] = []
-    if ai_text:
-        ai_lines.append("AI recommendation:")
-        for paragraph in ai_text.splitlines():
-            wrapped = textwrap.wrap(paragraph, width=90)
-            ai_lines.extend(wrapped or [""])
-    else:
-        ai_lines.append("AI recommendation unavailable. Generate the report once the assistant is reachable.")
-    y = _render_lines(can, ai_lines, margin, page_height, y, line_height)
-    y -= line_height
-
-    can.setFont("Helvetica-Bold", 14)
-    can.drawString(margin, y, "Appendix · Visuals & Contacts")
-    y -= line_height
-    can.setLineWidth(0.5)
-    can.line(margin, y, width - margin, y)
-    y -= int(1.2 * line_height)
-    appendix_lines = [
-        "• Radar chart: Healthy City pillar scores", 
-        "• Map overlays: latest heatmap selection and point analysis",
-        "• Municipal liaison (placeholder): +91 00000 00000 · resilience@city.gov",
-        "• Additional visualizations can be embedded in future iterations.",
-    ]
-    y = _render_lines(can, appendix_lines, margin, page_height, y, line_height)
-    y -= line_height
-
-    if radar_png or map_png:
-        if y < margin + 260:
-            can.showPage()
-            y = page_height - margin
-        if radar_png:
-            radar_reader = ImageReader(io.BytesIO(radar_png))
-            img_w, img_h = radar_reader.getSize()
-            max_width = (letter[0] - 2 * margin) / 2 - 12
-            scale = min(max_width / img_w, 220 / img_h)
-            draw_w = img_w * scale
-            draw_h = img_h * scale
-            can.drawImage(
-                radar_reader,
-                margin,
-                y - draw_h,
-                width=draw_w,
-                height=draw_h,
-                preserveAspectRatio=True,
-            )
-            can.setFont("Helvetica", 9)
-            can.drawString(margin, y - draw_h - 12, "Figure · HCI pillar radar chart")
-        if map_png:
-            map_reader = ImageReader(io.BytesIO(map_png))
-            img_w, img_h = map_reader.getSize()
-            max_width = (letter[0] - 2 * margin) / 2 - 12
-            scale = min(max_width / img_w, 220 / img_h)
-            draw_w = img_w * scale
-            draw_h = img_h * scale
-            x_pos = margin + ((letter[0] - 2 * margin) / 2) + 12
-            can.drawImage(
-                map_reader,
-                x_pos,
-                y - draw_h,
-                width=draw_w,
-                height=draw_h,
-                preserveAspectRatio=True,
-            )
-            can.setFont("Helvetica", 9)
-            can.drawString(x_pos, y - draw_h - 12, "Figure · Mumbai focus map")
-        y -= 240
-
-    can.save()
-    buffer.seek(0)
-    return buffer.read()
 def main() -> None:
     _initialise_session_state()
     st.session_state.setdefault("llm_response", None)
@@ -1176,7 +881,7 @@ def main() -> None:
             key="scenario_ndbi",
         )
 
-        scenario_region = _simulate_urban_scenario(region, greenery_target, built_target)
+        scenario_region = simulate_urban_scenario(region, greenery_target, built_target)
         scenario_scores = compute_scores(scenario_region)
         scenario_recs = recommendations(scenario_region, scenario_scores)
         scenario_hci = scenario_recs["hci"]
@@ -1281,12 +986,12 @@ def main() -> None:
                 st.session_state["llm_error"] = f"AI request failed: {exc}"
 
             ai_text = st.session_state.get("llm_response")
-            radar_png = _radar_chart_png(
-                {k: scenario_scores.get(k, 0.0) for k in ["air", "water", "green", "built"]},
+            radar_png = radar_chart_png(
+                scenario_scores,
                 "Scenario pillar mix",
             )
-            map_png = _map_snapshot_png(region, scenario_region)
-            pdf_bytes = _generate_pdf_report(
+            map_png = map_snapshot_png(region, scenario_region)
+            pdf_bytes = generate_pdf_report(
                 region,
                 scores,
                 recs,
