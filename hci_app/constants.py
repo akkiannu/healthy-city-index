@@ -49,7 +49,7 @@ HEATMAP_COLOR_SCHEMES = {
             [222, 45, 38],
             [165, 15, 21],
         ],
-        "legend": "Lower (light) = fewer people/km² · Higher (dark) = denser neighborhoods",
+        "legend": "Low = fewer residents · High = denser neighbourhoods",
     },
     "Population total": {
         "colors": [
@@ -61,7 +61,7 @@ HEATMAP_COLOR_SCHEMES = {
             [106, 81, 163],
             [74, 20, 134],
         ],
-        "legend": "Lower (light) = fewer residents · Higher (dark) = denser catchments",
+        "legend": "Low = smaller totals · High = larger catchments",
     },
     "Tree cover": {
         "colors": [
@@ -73,7 +73,7 @@ HEATMAP_COLOR_SCHEMES = {
             [35, 139, 69],
             [0, 90, 50],
         ],
-        "legend": "Lower (light) = sparse canopy · Higher (dark) = richer tree cover",
+        "legend": "Low = sparse canopy · High = richer cover",
     },
     "Water pollution": {
         "colors": [
@@ -85,8 +85,40 @@ HEATMAP_COLOR_SCHEMES = {
             [248, 113, 113],
             [220, 38, 38],
         ],
-        "legend": "Lower (blue) = clearer water · Higher (red) = potential pollution",
+        "legend": "Low = clearer water · High = turbid/polluted",
     },
+    "Built index": {
+        "colors": [
+            [74, 20, 134],
+            [122, 36, 180],
+            [190, 24, 105],
+            [239, 68, 68],
+            [249, 115, 22],
+            [253, 186, 116],
+            [255, 255, 178],
+        ],
+        "legend": "Low = softer landscapes · High = hardscape heavy",
+    },
+    "Land surface temp": {
+        "colors": [
+            [15, 118, 110],
+            [45, 197, 168],
+            [125, 211, 252],
+            [253, 224, 71],
+            [249, 115, 22],
+            [220, 38, 38],
+            [136, 19, 55],
+        ],
+        "legend": "Low = cooler skin temps · High = hotter surfaces",
+    },
+}
+
+
+PILLAR_DISPLAY = {
+    "air": "Air",
+    "water": "Water",
+    "green": "Green",
+    "built": "Built index",
 }
 
 
@@ -100,4 +132,5 @@ __all__ = [
     "DEFAULT_POINT",
     "DEFAULT_HEATMAP_COLORS",
     "HEATMAP_COLOR_SCHEMES",
+    "PILLAR_DISPLAY",
 ]

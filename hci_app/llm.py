@@ -1,71 +1,67 @@
-"""LLM helper for generating urban planning suggestions."""
+"""Lightweight helper to generate planning suggestions via OpenAI."""
 
 from __future__ import annotations
 
 import json
 import os
-from functools import lru_cache
-from typing import Dict, Optional
+from typing import Any, Dict
 
 from openai import OpenAI
 
-# Cheapest hosted tier: GPT-4.1 Nano delivers low-latency, low-cost planning hints.
 MODEL_NAME = "gpt-5-nano"
 
 
 class LLMUnavailable(RuntimeError):
-    """Raised when the LLM cannot be contacted."""
+    """Raised when the language model cannot be reached or returns nothing."""
 
 
 def _client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise LLMUnavailable(
-            "OPENAI_API_KEY environment variable is not set. "
-            "Provide a key before requesting AI recommendations."
+            "OPENAI_API_KEY is not set. Export it before requesting AI plans."
         )
     return OpenAI(api_key=api_key)
 
 
-@lru_cache(maxsize=64)
-def generate_planning_advice(payload_hash: str, prompt: str) -> str:
+def _format_prompt(payload: Dict[str, Any]) -> str:
+    """Build a concise prompt describing metrics and expectations for the LLM."""
+
+    pretty_payload = json.dumps(payload, indent=2, ensure_ascii=False)
+    instructions = (
+        "Review the urban indicators below. "
+        "For each pillar (Habitability, Parks & Greenery, Waste Management, Disease Risk)"
+        " give a one-line insight, then list two very short actions and one data check."
+    )
+    return f"{instructions}\n\n{pretty_payload}"
+
+
+def generate_plan(payload: Dict[str, Any]) -> str:
     """Call the OpenAI Responses API and return the generated advice."""
 
+    prompt = _format_prompt(payload)
     client = _client()
     try:
         response = client.responses.create(
             model=MODEL_NAME,
-            input=prompt,
+            input=[
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                }
+            ],
             instructions=(
-                "You are an urban planning strategist. "
-                "Analyse the provided city metrics and deliver a concise, actionable plan. "
-                "Prioritise the top risks, mention specific interventions, and end with one data follow-up."
+                "You are an experienced urban planner. "
+                "For each pillar give a single concise sentence, then provide two quick actions and one follow-up check."
             ),
         )
-    except Exception as exc:  # pragma: no cover - depends on network/LLM availability
+    except Exception as exc:  # pragma: no cover - network/LLM dependent
         raise LLMUnavailable(f"LLM request failed: {exc}") from exc
 
-    content = response.output_text or ""
-    return content.strip()
+    content = (response.output_text or "").strip()
+    if not content:
+        raise LLMUnavailable("Model returned an empty response. Try again later.")
+    return content
 
 
-def build_prompt(payload: Dict) -> str:
-    """Format the metrics payload into a readable prompt."""
-
-    pretty_payload = json.dumps(payload, indent=2, ensure_ascii=False)
-    guidance = (
-        "Using the metrics below, outline up to three priority actions for urban planners. "
-        "Reference the key indicators driving each action. Close with one suggested data follow-up.\n\n"
-    )
-    return guidance + pretty_payload
-
-
-def llm_recommendations(payload: Dict) -> str:
-    """Generate planning advice for the given payload."""
-
-    prompt = build_prompt(payload)
-    cache_key = json.dumps(payload, sort_keys=True)
-    return generate_planning_advice(cache_key, prompt)
-
-
-__all__ = ["llm_recommendations", "LLMUnavailable"]
+__all__ = ["generate_plan", "LLMUnavailable"]

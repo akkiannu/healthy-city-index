@@ -10,7 +10,8 @@ custom vector layers once NASA data products are ready.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from dataclasses import replace
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -23,45 +24,48 @@ from hci_app.constants import (
     DEFAULT_TREECOVER_RASTER,
     HEATMAP_COLOR_SCHEMES,
     MUMBAI_BOUNDS,
+    PILLAR_DISPLAY,
 )
 from hci_app.airquality import fetch_air_quality
 from hci_app.earthengine import (
     DEFAULT_CREDENTIALS_PATH,
     EarthEngineUnavailable,
     vegetation_indices as gee_vegetation_indices,
+    built_index_heatmap as gee_built_index_heatmap,
     water_pollution_heatmap as gee_water_pollution_heatmap,
     water_pollution_indices as gee_water_pollution,
 )
+from hci_app.nasa import fetch_lst, fetch_lst_heatmap
 from hci_app.maps import map_layers, prepare_heatmap_dataframe, selection_to_point
 from hci_app.models import fetch_region_data
 from hci_app.raster import raster_dataframe, raster_value_from_path
 from hci_app.scoring import clamp_value, compute_scores, recommendations
-from hci_app.llm import LLMUnavailable, llm_recommendations
+from hci_app.llm import LLMUnavailable, generate_plan
 
 
 st.set_page_config(page_title="Healthy City Index — Mumbai", layout="wide")
 
 
 METRIC_IMPACTS: Dict[str, str] = {
-    "PM2.5": "Fine particulates drive respiratory risk and spotlight emission-control needs.",
-    "NO₂ (column)": "Reactive nitrogen traces traffic pressure and street ventilation gaps.",
-    "CO (column)": "Carbon monoxide reveals incomplete combustion hotspots for transit or fuel fixes.",
-    "CO₂": "Local carbon load signals where efficiency retrofits and clean power matter most.",
-    "Water pollution (SWIR ratio)": "High ratios hint at turbid or polluted waters needing remediation.",
-    "NDVI": "Vegetation coverage guides cooling corridors and nature-based infrastructure sites.",
-    "NDWI": "Surface moisture marks wetlands or flood buffers to safeguard.",
-    "NDBI": "Built-up intensity shows hardscape concentration for balancing land use.",
-    "SAVI": "Vegetation health flags parks needing irrigation or soil rehabilitation.",
-    "Population density": "Where residents cluster, services and evacuation plans must scale.",
-    "Population (est.)": "Total headcount informs school, health, and mobility capacity planning.",
-    "Tree cover": "Tree canopy cools streetscapes and improves air—priority zones for preservation.",
-    "Land surface temp": "Hot surfaces expose heat islands requiring shade or cool-roof programs.",
-    "Industrial proximity": "Nearby industry demands buffers and compatibility checks in zoning.",
-    "HCI (0–1, higher better)": "Composite livability score to target the weakest planning dimension.",
-    "Composite HCI": "Narrative indicator for briefing leadership on overall urban resilience.",
-    "Latitude": "Anchor coordinate to align zoning and infrastructure overlays.",
-    "Longitude": "Works with latitude to place interventions within cadastral grids.",
-    "LST": "Thermal readings pinpoint microclimate stress needing cooling interventions.",
+    "PM2.5": "High values flag urgent air-quality controls.",
+    "NO₂ (column)": "Tracks traffic pressure and ventilation gaps.",
+    "CO (column)": "Points to combustion hotspots to fix.",
+    "CO₂": "Signals carbon-intensive districts to decarbonise.",
+    "Water pollution (SWIR ratio)": "Shows where coastal water runs murky.",
+    "NDVI": "Reveals how much cooling greenery exists.",
+    "NDWI": "Marks wetter ground or flood buffers.",
+    "NDBI": "Highlights hardscape-heavy blocks.",
+    "SAVI": "Flags stressed urban vegetation.",
+    "Population density": "Dense spots need upgraded services.",
+    "Population (est.)": "Total residents guide capacity sizing.",
+    "Tree cover": "Canopy cools streets—protect high areas.",
+    "Land surface temp": "Hotter tiles are heat-island targets.",
+    "Industrial proximity": "Nearby plants need buffers and zoning care.",
+    "HCI (0–1, higher better)": "Overall livability snapshot.",
+    "Composite HCI": "Quick resilience headline for planners.",
+    "Latitude": "Fixes the site for cross-referencing maps.",
+    "Longitude": "Pairs with latitude to locate the block.",
+    "LST": "Surface heat needing shade or cool roofs.",
 }
 
 BASEMAP_TEMPLATES: Dict[str, str] = {
@@ -77,8 +81,9 @@ def _initialise_session_state() -> None:
 
 
 def _radar_chart(scores: Dict[str, float]) -> go.Figure:
-    categories = ["Air", "Water", "Green", "Population", "Temperature", "Industrial"]
-    values = [round(scores[key.lower()], 3) * 100 for key in categories]
+    pillar_keys = ["air", "water", "green", "built"]
+    categories = [PILLAR_DISPLAY[key] for key in pillar_keys]
+    values = [round(scores[key], 3) * 100 for key in pillar_keys]
     return go.Figure(
         data=go.Scatterpolar(
             r=values + values[:1], theta=categories + categories[:1], fill="toself"
@@ -101,51 +106,63 @@ def _heatmap_legend_html(
         percent = idx / total * 100
         stops.append(f"#{r:02x}{g:02x}{b:02x} {percent:.0f}%")
 
-    low_label = "Low"
-    high_label = "High"
+    low_text = "Low"
+    high_text = "High"
     if legend_text:
         parts = [part.strip() for part in legend_text.split("·")]
         if parts:
-            low_label = parts[0]
+            low_text = parts[0]
             if len(parts) > 1:
-                high_label = parts[1]
+                high_text = parts[1]
 
     gradient = ", ".join(stops)
     return f"""
 <style>
 .hci-legend {{
-  display: flex;
-  align-items: center;
+  display: grid;
+  grid-template-columns: 1fr;
+  row-gap: 0.25rem;
   font-size: 0.7rem;
-  gap: 0.75rem;
   margin-top: 0.35rem;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.6rem;
 }}
-.hci-legend-name {{
+.hci-legend-title {{
   font-weight: 600;
+  text-align: center;
+  letter-spacing: 0.04em;
+}}
+.hci-legend-bar-row {{
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  column-gap: 0.5rem;
 }}
 .hci-legend-bar {{
-  flex: 1 1 auto;
   height: 12px;
   border-radius: 999px;
   background: linear-gradient(90deg, {gradient});
   border: 1px solid rgba(15, 23, 42, 0.08);
 }}
 .hci-legend-text {{
-  line-height: 1;
+  color: rgba(15, 23, 42, 0.7);
 }}
 </style>
 <div class="hci-legend">
-  <span class="hci-legend-name">{name}</span>
-  <div class="hci-legend-bar"></div>
-  <span class="hci-legend-text">{low_label}</span>
-  <span class="hci-legend-text">{high_label}</span>
+  <div class="hci-legend-title">{name}</div>
+  <div class="hci-legend-bar-row">
+    <span class="hci-legend-text">{low_text}</span>
+    <div class="hci-legend-bar"></div>
+    <span class="hci-legend-text">{high_text}</span>
+  </div>
 </div>
 """
 
 
 def main() -> None:
     _initialise_session_state()
+    st.session_state.setdefault("llm_response", None)
+    st.session_state.setdefault("llm_error", None)
+    st.session_state.setdefault("llm_error", None)
 
     default_density_path = (
         str(DEFAULT_POP_DENSITY_RASTER.resolve())
@@ -201,36 +218,11 @@ def main() -> None:
     population_total_status_placeholder = st.sidebar.empty()
     treecover_status_placeholder = st.sidebar.empty()
     if not population_raster_input:
-        population_status_placeholder.info("Population density currently uses mock values.")
+        population_status_placeholder.info("Density: mock values in use.")
     if not population_total_input:
-        population_total_status_placeholder.info("Population totals are not configured.")
+        population_total_status_placeholder.info("Totals: mock values in use.")
     if not treecover_input:
-        treecover_status_placeholder.info("Tree cover overlay not configured.")
-
-    st.sidebar.header("Map appearance")
-    default_style = "Street view"
-    basemap_options = list(BASEMAP_TEMPLATES.keys())
-    st.session_state.setdefault("basemap_style", default_style)
-    current_style = st.session_state.get("basemap_style", default_style)
-    basemap_style = st.sidebar.selectbox(
-        "Base map",
-        basemap_options,
-        index=basemap_options.index(current_style) if current_style in basemap_options else 0,
-        help="Switch between street, satellite, or terrain tiles.",
-    )
-    st.session_state["basemap_style"] = basemap_style
-    basemap_tile_url = BASEMAP_TEMPLATES[basemap_style]
-
-    st.sidebar.subheader("Heatmap controls")
-    st.session_state.setdefault("heatmap_opacity", 0.75)
-    heatmap_opacity_input = st.sidebar.slider(
-        "Heatmap opacity",
-        min_value=0.0,
-        max_value=1.0,
-        value=float(st.session_state["heatmap_opacity"]),
-        step=0.05,
-    )
-    st.session_state["heatmap_opacity"] = heatmap_opacity_input
+        treecover_status_placeholder.info("Tree cover: mock values in use.")
 
     st.sidebar.header("Remote data")
     st.session_state.setdefault("use_gee", False)
@@ -257,25 +249,6 @@ def main() -> None:
                 "Earth Engine credentials not found; vegetation metrics will use mock values."
             )
 
-    heatmap_options = [
-        "None",
-        "Population density",
-        "Population total",
-        "Tree cover",
-        "Water pollution",
-    ]
-    default_heatmap_index = 0
-    if population_raster_input:
-        default_heatmap_index = 1
-    elif treecover_input:
-        default_heatmap_index = 3
-    heatmap_choice = st.sidebar.selectbox(
-        "Heatmap overlay",
-        heatmap_options,
-        index=default_heatmap_index,
-        help="Choose a layer to visualise as a heat map across Mumbai.",
-    )
-
     st.title("🌆 Healthy City Index — Mumbai")
     st.caption("Streamlit port • Mock indicators that mirror the React wireframe")
 
@@ -293,6 +266,7 @@ def main() -> None:
 
     with tab_map:
         point = st.session_state.point
+        basemap_tile_url = BASEMAP_TEMPLATES["Street view"]
         col_map, col_metrics = st.columns([1.7, 1.3], gap="large")
 
         rect_size = 0.01
@@ -304,31 +278,48 @@ def main() -> None:
         }
 
         with col_map:
-            st.subheader("Pick a location")
-            with st.form(key="location_form", clear_on_submit=False):
-                lat_value = st.number_input(
-                    "Latitude",
-                    min_value=18.5,
-                    max_value=20.0,
-                    value=float(st.session_state.point["lat"]),
-                    step=0.0005,
-                    format="%.4f",
-                )
-                lon_value = st.number_input(
-                    "Longitude",
-                    min_value=72.5,
-                    max_value=73.5,
-                    value=float(st.session_state.point["lon"]),
-                    step=0.0005,
-                    format="%.4f",
-                )
-                submitted = st.form_submit_button("Update location")
+            st.subheader("Map Explorer")
 
-            if submitted:
-                st.session_state.point = {"lat": lat_value, "lon": lon_value}
-                point = st.session_state.point
+            heatmap_options = [
+                "None",
+                "Population density",
+                "Population total",
+                "Tree cover",
+                "Water pollution",
+                "Land surface temp",
+                "Built index",
+            ]
+            if population_raster_input:
+                default_heatmap = "Population density"
+            elif population_total_input:
+                default_heatmap = "Population total"
+            elif treecover_input:
+                default_heatmap = "Tree cover"
+            elif use_gee:
+                default_heatmap = "Water pollution"
             else:
-                point = st.session_state.point
+                default_heatmap = "None"
+
+            stored_choice = st.session_state.get("heatmap_choice", default_heatmap)
+            if stored_choice not in heatmap_options:
+                stored_choice = default_heatmap
+            heatmap_choice = st.selectbox(
+                "Heatmap overlay",
+                heatmap_options,
+                index=heatmap_options.index(stored_choice),
+                key="heatmap_choice",
+            )
+
+            if "heatmap_opacity" not in st.session_state:
+                st.session_state["heatmap_opacity"] = 0.75
+            heatmap_opacity_input = st.slider(
+                "Heatmap opacity",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(st.session_state["heatmap_opacity"]),
+                step=0.05,
+                key="heatmap_opacity",
+            )
 
             heatmap_df_map: Optional[pd.DataFrame] = None
             heatmap_label = ""
@@ -447,6 +438,65 @@ def main() -> None:
                     heatmap_error_message = (
                         "Water pollution heatmap requires Earth Engine credentials."
                     )
+            elif heatmap_choice == "Land surface temp":
+                heatmap_df_raw, heatmap_info = fetch_lst_heatmap(
+                    MUMBAI_BOUNDS[3],
+                    MUMBAI_BOUNDS[1],
+                    MUMBAI_BOUNDS[2],
+                    MUMBAI_BOUNDS[0],
+                )
+                if heatmap_df_raw is not None:
+                    heatmap_colors = HEATMAP_COLOR_SCHEMES["Land surface temp"][
+                        "colors"
+                    ]
+                    heatmap_legend = HEATMAP_COLOR_SCHEMES["Land surface temp"].get(
+                        "legend"
+                    )
+                    heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
+                        heatmap_df_raw, colors=heatmap_colors
+                    )
+                    heatmap_df_map["value_display"] = heatmap_df_map["value"].map(
+                        lambda v: f"{v:.1f}"
+                    )
+                    heatmap_label = "Land surface temp"
+                    heatmap_units = "°C"
+                    heatmap_color_range = heatmap_colors
+                    info_text = heatmap_info or "NASA POWER TS averages"
+                    heatmap_caption = (
+                        f"{heatmap_label} ≈ {vmin:.1f} – {vmax:.1f} {heatmap_units} · {info_text}"
+                    )
+                    heatmap_error_message = None
+                else:
+                    heatmap_error_message = heatmap_info or (
+                        "NASA POWER returned no land surface temperature samples."
+                    )
+            elif heatmap_choice == "Built index":
+                if use_gee and gee_credentials_resolved is not None:
+                    heatmap_df_raw, heatmap_error_message = gee_built_index_heatmap(
+                        MUMBAI_BOUNDS[3],
+                        MUMBAI_BOUNDS[1],
+                        MUMBAI_BOUNDS[2],
+                        MUMBAI_BOUNDS[0],
+                        credentials_path=gee_credentials_resolved,
+                    )
+                    if heatmap_df_raw is not None:
+                        heatmap_colors = HEATMAP_COLOR_SCHEMES["Built index"]["colors"]
+                        heatmap_legend = HEATMAP_COLOR_SCHEMES["Built index"].get("legend")
+                        heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
+                            heatmap_df_raw, colors=heatmap_colors
+                        )
+                        heatmap_df_map["value_display"] = heatmap_df_map["value"].map(
+                            lambda v: f"{v:.2f}"
+                        )
+                        heatmap_label = "Built index"
+                        heatmap_units = "NDBI"
+                        heatmap_color_range = heatmap_colors
+                        heatmap_caption = f"{heatmap_label} ≈ {vmin:.2f} – {vmax:.2f}"
+                        heatmap_error_message = None
+                else:
+                    heatmap_error_message = (
+                        "Built index heatmap requires Earth Engine credentials."
+                    )
 
             map_deck, _ = map_layers(
                 point,
@@ -508,6 +558,7 @@ def main() -> None:
         vegetation_override = None
         water_quality_override: Optional[Dict[str, Optional[float]]] = None
         air_quality_override: Optional[Dict[str, Optional[float]]] = None
+        lst_override: Optional[float] = None
 
         if use_gee and gee_credentials_resolved is not None:
             vegetation_status = st.empty()
@@ -552,6 +603,14 @@ def main() -> None:
         else:
             air_status.warning("⚠️ Air-quality service returned no data; using mock values.")
 
+        lst_status = st.empty()
+        lst_value, lst_message = fetch_lst(point["lat"], point["lon"])
+        if lst_value is not None:
+            lst_override = lst_value
+            lst_status.success(f"✅ {lst_message}")
+        else:
+            lst_status.warning(f"⚠️ {lst_message or 'Skin temperature uses mock values.'}")
+
         if population_raster_input:
             density_value, density_error = raster_value_from_path(
                 population_raster_input, point["lat"], point["lon"]
@@ -561,7 +620,7 @@ def main() -> None:
             else:
                 population_override = density_value
                 population_status_placeholder.success(
-                    f"Population density sample: {population_override:,.0f} people/km²"
+                    f"Density sample: {population_override:,.0f} /km²"
                 )
         if population_total_input:
             pop_total_value, pop_total_error = raster_value_from_path(
@@ -572,7 +631,7 @@ def main() -> None:
             else:
                 population_total_override = pop_total_value
                 population_total_status_placeholder.success(
-                    f"Population total sample: {population_total_override:,.0f} people"
+                    f"Total sample: {population_total_override:,.0f} ppl"
                 )
         if treecover_input:
             treecover_value, treecover_error = raster_value_from_path(
@@ -594,6 +653,8 @@ def main() -> None:
             air_quality=air_quality_override,
             water_quality=water_quality_override,
         )
+        if lst_override is not None:
+            region = replace(region, lst_c=lst_override)
         scores = compute_scores(region)
         recs = recommendations(region, scores)
 
@@ -611,49 +672,55 @@ def main() -> None:
         water_real = bool(water_quality_override and water_quality_override.get("swir_ratio") is not None)
 
         with col_metrics:
-            st.subheader(
-                f"📊 Indicators @ {region.lat:.4f}, {region.lon:.4f}"
-            )
+            st.subheader(f"📊 Indicators @ {region.lat:.4f}, {region.lon:.4f}")
 
-            metrics = [
-                ("PM2.5", f"{region.air_pm25:.1f} µg/m³", air_real.get("pm2_5", False)),
-                ("NO₂ (column)", f"{region.air_no2:.1f} µmol/m²", air_real.get("no2", False)),
-                ("CO (column)", f"{region.air_co:.1f} µmol/m²", air_real.get("co", False)),
-                ("CO₂", f"{region.air_co2:.1f} ppm", air_real.get("co2", False)),
-                ("Water pollution (SWIR ratio)", f"{region.water_pollution:.2f}", water_real),
-                ("NDVI", f"{region.ndvi:.2f}", vegetation_real.get("ndvi", False)),
-                ("NDWI", f"{region.ndwi:.2f}", vegetation_real.get("ndwi", False)),
-                ("NDBI", f"{region.ndbi:.2f}", vegetation_real.get("ndbi", False)),
-                ("SAVI", f"{region.savi:.2f}", vegetation_real.get("savi", False)),
-                ("Population density", f"{region.pop_density:,.0f} /km²", population_real),
-                ("Land surface temp", f"{region.lst_c:.1f} °C", False),
-                ("Industrial proximity", f"{region.industrial_km:.2f} km", False),
+            pillar_descriptions = {
+                "air": "Blend of PM₂.₅ + NO₂ (higher = cleaner air).",
+                "water": "SWIR turbidity proxy (higher = murkier water).",
+                "green": "Vegetation cover index (higher = greener).",
+                "built": "Normalized difference built-up index (higher = harder surfaces).",
+            }
+
+            table_rows = []
+            for key in ["air", "water", "green", "built"]:
+                table_rows.append(
+                    {
+                        "Metric": f"{PILLAR_DISPLAY[key]} score",
+                        "Value": f"{scores[key]*100:.0f} / 100",
+                        "Description": pillar_descriptions[key],
+                    }
+                )
+
+            raw_metrics = [
+                ("PM2.5", f"{region.air_pm25:.1f} µg/m³"),
+                ("NO₂ (column)", f"{region.air_no2:.1f} µmol/m²"),
+                ("CO₂", f"{region.air_co2:.1f} ppm"),
+                ("NDWI", f"{region.ndwi:.2f}"),
+                ("NDBI", f"{region.ndbi:.2f}"),
+                ("Population density", f"{region.pop_density:,.0f} /km²"),
+                ("Population (est.)", f"{population_total_override:,.0f} people" if population_total_override is not None else "—"),
+                ("Tree cover", f"{treecover_override:.1f}%" if treecover_override is not None else "—"),
+                ("Land surface temp", f"{region.lst_c:.1f} °C" if lst_override is not None else "—"),
             ]
 
-            for entry in metrics:
-                if len(entry) == 3:
-                    label, value, is_real = entry
-                else:
-                    label, value = entry
-                    is_real = True
-                display_label = f"{label}{'' if is_real else '*'}"
-                if not is_real:
-                    mock_tracker["used"] = True
-                st.metric(label=display_label, value=value)
-                info = METRIC_IMPACTS.get(label)
-                if info:
-                    st.caption(info)
+            if not population_real:
+                mock_tracker["used"] = True
+            if population_total_override is None:
+                mock_tracker["used"] = True
+            if treecover_override is None:
+                mock_tracker["used"] = True
+            if lst_override is None:
+                mock_tracker["used"] = True
 
-            if population_total_override is not None:
-                st.metric("Population (est.)", f"{population_total_override:,.0f} people")
-                info = METRIC_IMPACTS.get("Population (est.)")
-                if info:
-                    st.caption(info)
-            if treecover_override is not None:
-                st.metric("Tree cover", f"{treecover_override:,.1f}%")
-                info = METRIC_IMPACTS.get("Tree cover")
-                if info:
-                    st.caption(info)
+            for label, value in raw_metrics:
+                description = METRIC_IMPACTS.get(label, "")
+                table_rows.append({"Metric": label, "Value": value, "Description": description})
+
+            st.dataframe(
+                pd.DataFrame(table_rows),
+                hide_index=True,
+                use_container_width=True,
+            )
 
             st.markdown("### Composite HCI")
             st.metric(label="HCI (0–1, higher better)", value=f"{recs['hci']:.2f}")
@@ -662,47 +729,34 @@ def main() -> None:
                 st.caption(info)
             st.plotly_chart(_radar_chart(scores), use_container_width=True)
 
-            if (
-                population_override is not None
-                and population_total_override is not None
-                and treecover_override is not None
-            ):
-                st.caption(
-                    "Population density, population totals, and tree cover are sourced"
-                    " from the provided rasters. Other indicators remain mocked until"
-                    " their data sources are wired."
-                )
-            elif population_override is not None and population_total_override is not None:
-                st.caption(
-                    "Population density and total population sourced from the"
-                    " provided rasters. Other indicators remain mocked until"
-                    " their data sources are wired."
-                )
-            elif population_override is not None and treecover_override is not None:
-                st.caption(
-                    "Population density and tree cover sourced from the provided"
-                    " rasters. Remaining indicators still use mock values."
-                )
-            elif population_override is not None:
-                st.caption(
-                    "Population density sourced from the provided raster. Other"
-                    " indicators remain mocked until their data sources are wired."
-                )
-            elif population_total_override is not None:
-                st.caption(
-                    "Population totals sourced from the provided raster. Density"
-                    " and the remaining indicators still use mock values."
-                )
-            elif treecover_override is not None:
-                st.caption(
-                    "Tree cover values sourced from the provided raster. All other"
-                    " indicators currently use mock values."
-                )
-            else:
-                st.caption(
-                    "⚠️ Mock values for wireframe. Swap `fetch_region_data` with"
-                    " backend calls as data sources come online."
-                )
+        source_notes = []
+        source_notes.append(
+            "Air quality sourced from Open-Meteo API." if any(air_real.values()) else "Air quality currently uses mock values."
+        )
+        source_notes.append(
+            "Water layer sampled via Earth Engine SWIR ratios." if water_real else "Water layer currently falls back to mock values."
+        )
+        source_notes.append(
+            "Green cover derived from vegetation indices." if vegetation_real.get("ndvi") else "Green cover currently uses mock vegetation values."
+        )
+        source_notes.append(
+            "Built index derived from Sentinel SWIR/NIR bands." if vegetation_real.get("ndbi") else "Built index currently uses mock values."
+        )
+        source_notes.append(
+            "LST (earth skin temp) from NASA POWER." if lst_override is not None else "LST currently uses mock values."
+        )
+
+        for note in source_notes:
+            st.caption(note)
+
+        if (
+            not any(air_real.values())
+            or not water_real
+            or not vegetation_real.get("ndvi")
+            or not vegetation_real.get("ndbi")
+            or lst_override is None
+        ):
+            mock_tracker["used"] = True
 
     with tab_ai:
         col_left, col_right = st.columns([1.2, 1], gap="large")
@@ -713,7 +767,7 @@ def main() -> None:
                 ("Latitude", f"{region.lat:.5f}", True),
                 ("Longitude", f"{region.lon:.5f}", True),
                 ("PM2.5", f"{region.air_pm25} μg/m³", air_real.get("pm2_5", False)),
-                ("LST", f"{region.lst_c} °C", False),
+                ("Land surface temp", f"{region.lst_c} °C", False),
                 ("Population density", f"{region.pop_density} /km²", population_real),
                 ("NO₂ (column)", f"{region.air_no2:.1f} µmol/m²", air_real.get("no2", False)),
                 ("CO (column)", f"{region.air_co:.1f} µmol/m²", air_real.get("co", False)),
@@ -742,24 +796,25 @@ def main() -> None:
             st.write("**Parks / Greenery:**", recs["parks"])
             st.write("**Waste Management:**", recs["waste"])
             st.write("**Disease Risk:**", recs["disease"])
-            st.caption(
-                "Swap this panel with real LLM outputs by forwarding indicators and"
-                " scores as structured context."
-            )
 
             st.divider()
-            st.subheader("AI action plan")
+            st.subheader("AI Action Plan")
             llm_placeholder = st.empty()
-            st.session_state.setdefault("llm_response", None)
 
-            def _llm_payload() -> Dict:
-                return {
+            if st.button("Generate AI plan", type="primary"):
+                payload: Dict[str, Any] = {
                     "location": {
                         "lat": round(region.lat, 5),
                         "lon": round(region.lon, 5),
                     },
-                    "scores": {k: float(v) for k, v in scores.items()},
-                    "composite_hci": float(recs["hci"]),
+                    "composite_hci": round(float(recs["hci"]), 3),
+                    "pillar_notes": {
+                        "habitability": recs["habitability"],
+                        "parks_greenery": recs["parks"],
+                        "waste_management": recs["waste"],
+                        "disease_risk": recs["disease"],
+                    },
+                    "scores": {key: round(float(value), 3) for key, value in scores.items()},
                     "metrics": {
                         "pm2_5_ugm3": region.air_pm25,
                         "no2_umolm2": region.air_no2,
@@ -771,37 +826,36 @@ def main() -> None:
                         "ndbi": region.ndbi,
                         "savi": region.savi,
                         "population_density_per_km2": region.pop_density,
+                        "population_total_estimate": population_total_override,
+                        "tree_cover_percent": treecover_override,
                         "land_surface_temp_c": region.lst_c,
                         "industrial_distance_km": region.industrial_km,
+                        "heatmap_selected": heatmap_choice,
                     },
-                    "data_sources": {
-                        "population_density": "raster" if population_real else "mock",
-                        "population_total": "raster" if population_total_real else "mock",
-                        "tree_cover": "raster" if treecover_real else "mock",
-                        "air_quality": "open-meteo API" if any(air_real.values()) else "mock",
-                        "water_pollution": "earth engine" if water_real else "mock",
+                    "data_quality": {
+                        "air": any(air_real.values()),
+                        "water": water_real,
+                        "green": vegetation_real.get("ndvi", False),
+                        "built": vegetation_real.get("ndbi", False),
                     },
-                    "heatmap": heatmap_choice,
                 }
 
-            if st.button("Generate AI plan", type="primary"):
                 try:
                     with st.spinner("Consulting urban-planning assistant..."):
-                        payload = _llm_payload()
-                        response_text = llm_recommendations(payload)
-                        st.session_state["llm_response"] = response_text
+                        response_text = generate_plan(payload)
+                    st.session_state["llm_response"] = response_text
+                    st.session_state["llm_error"] = None
                 except LLMUnavailable as exc:
                     st.session_state["llm_response"] = None
-                    llm_placeholder.warning(str(exc))
-                except Exception as exc:  # pragma: no cover
-                    st.session_state["llm_response"] = None
-                    llm_placeholder.error(f"AI request failed: {exc}")
+                    st.session_state["llm_error"] = str(exc)
 
-            if st.session_state["llm_response"]:
+            if st.session_state.get("llm_response"):
                 llm_placeholder.markdown(st.session_state["llm_response"])
-            elif not st.session_state.get("llm_response"):
+            elif st.session_state.get("llm_error"):
+                llm_placeholder.warning(st.session_state["llm_error"])
+            else:
                 llm_placeholder.caption(
-                    "Tip: set OPENAI_API_KEY in your environment to enable AI-generated action plans."
+                    "Tip: export OPENAI_API_KEY before launching the app to unlock AI-generated action plans."
                 )
 
     st.divider()

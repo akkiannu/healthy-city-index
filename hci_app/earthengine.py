@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -139,7 +139,7 @@ def _mean_from_dataset(
     end_date: str,
     scale: int,
     statistic: str = "mean",
-    extra_filter: Optional[ee.Filter] = None,
+    extra_filter: Optional[Any] = None,
 ):
     collection = ee.ImageCollection(collection_id).filterBounds(aoi).filterDate(start_date, end_date)
     if extra_filter is not None:
@@ -445,6 +445,221 @@ def water_pollution_heatmap(
     return dataframe, None
 
 
+@lru_cache(maxsize=32)
+def _cached_built_index_map(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    start_date: str,
+    end_date: str,
+    max_cloud: int,
+    credentials_path: Path,
+    scale: int,
+    num_pixels: int,
+) -> Optional[pd.DataFrame]:
+    status, error = initialise(credentials_path)
+    if not status:
+        raise EarthEngineUnavailable(error or "Earth Engine unavailable")
+
+    aoi = _geometry_from_bounds(north, south, east, west)
+    sentinel = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(aoi)
+        .filterDate(start_date, end_date)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", max_cloud))
+        .median()
+    )
+
+    try:
+        ndbi = sentinel.expression(
+            "(SWIR - NIR) / (SWIR + NIR)",
+            {"SWIR": sentinel.select("B11"), "NIR": sentinel.select("B8")},
+        ).rename("ndbi")
+    except Exception:
+        return None
+
+    lonlat = ee.Image.pixelLonLat()
+    sample_image = ndbi.addBands(lonlat)
+
+    try:
+        samples = sample_image.sample(
+            region=aoi,
+            scale=scale,
+            projection="EPSG:4326",
+            numPixels=num_pixels,
+            geometries=True,
+            tileScale=4,
+        )
+        features = samples.getInfo().get("features", [])
+    except Exception:
+        return None
+
+    if not features:
+        return None
+
+    rows = []
+    for feature in features:
+        props = feature.get("properties", {})
+        geometry = feature.get("geometry", {})
+        coords = geometry.get("coordinates")
+        value = props.get("ndbi")
+        if coords is None or value is None:
+            continue
+        try:
+            lon_val, lat_val = float(coords[0]), float(coords[1])
+            rows.append({"lon": lon_val, "lat": lat_val, "value": float(value)})
+        except (TypeError, ValueError):
+            continue
+
+    if not rows:
+        return None
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def built_index_heatmap(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    start_date: str = DEFAULT_WATER_DATE_RANGE[0],
+    end_date: str = DEFAULT_WATER_DATE_RANGE[1],
+    max_cloud: int = DEFAULT_CLOUD_COVER,
+    credentials_path: Optional[Path] = None,
+    scale: int = 300,
+    num_pixels: int = 4000,
+) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    path = credentials_path or DEFAULT_CREDENTIALS_PATH
+    try:
+        dataframe = _cached_built_index_map(
+            north,
+            south,
+            east,
+            west,
+            start_date,
+            end_date,
+            max_cloud,
+            path.resolve(),
+            scale,
+            num_pixels,
+        )
+    except EarthEngineUnavailable as exc:
+        return None, str(exc)
+    except Exception as exc:
+        return None, str(exc)
+
+    if dataframe is None or dataframe.empty:
+        return None, "Built index dataset returned no samples."
+    return dataframe, None
+
+
+@lru_cache(maxsize=32)
+def _cached_lst_map(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    start_date: str,
+    end_date: str,
+    max_cloud: int,
+    credentials_path: Path,
+    scale: int,
+    num_pixels: int,
+) -> Optional[pd.DataFrame]:
+    status, error = initialise(credentials_path)
+    if not status:
+        raise EarthEngineUnavailable(error or "Earth Engine unavailable")
+
+    aoi = _geometry_from_bounds(north, south, east, west)
+    collection = (
+        ee.ImageCollection("MODIS/061/MOD11A2")
+        .select("LST_Day_1km")
+        .filterBounds(aoi)
+        .filterDate(start_date, end_date)
+    )
+
+    try:
+        lst_kelvin = collection.mean()
+    except Exception:
+        return None
+
+    # Convert to °C: scale factor 0.02 and subtract 273.15
+    lst_celsius = lst_kelvin.multiply(0.02).subtract(273.15).rename("lst_c")
+    lonlat = ee.Image.pixelLonLat()
+    sample_image = lst_celsius.addBands(lonlat)
+
+    try:
+        samples = sample_image.sample(
+            region=aoi,
+            scale=scale,
+            projection="EPSG:4326",
+            numPixels=num_pixels,
+            geometries=True,
+            tileScale=4,
+        )
+        features = samples.getInfo().get("features", [])
+    except Exception:
+        return None
+
+    rows = []
+    for feature in features:
+        props = feature.get("properties", {})
+        geometry = feature.get("geometry", {})
+        coords = geometry.get("coordinates")
+        value = props.get("lst_c")
+        if coords is None or value is None:
+            continue
+        try:
+            lon_val, lat_val = float(coords[0]), float(coords[1])
+            rows.append({"lon": lon_val, "lat": lat_val, "value": float(value)})
+        except (TypeError, ValueError):
+            continue
+
+    if not rows:
+        return None
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def lst_heatmap(
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    start_date: str = DEFAULT_WATER_DATE_RANGE[0],
+    end_date: str = DEFAULT_WATER_DATE_RANGE[1],
+    max_cloud: int = DEFAULT_CLOUD_COVER,
+    credentials_path: Optional[Path] = None,
+    scale: int = 1000,
+    num_pixels: int = 3000,
+) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    path = credentials_path or DEFAULT_CREDENTIALS_PATH
+    try:
+        dataframe = _cached_lst_map(
+            north,
+            south,
+            east,
+            west,
+            start_date,
+            end_date,
+            max_cloud,
+            path.resolve(),
+            scale,
+            num_pixels,
+        )
+    except EarthEngineUnavailable as exc:
+        return None, str(exc)
+    except Exception as exc:
+        return None, str(exc)
+
+    if dataframe is None or dataframe.empty:
+        return None, "LST dataset returned no samples."
+    return dataframe, None
+
+
 __all__ = [
     "EarthEngineUnavailable",
     "DEFAULT_CREDENTIALS_PATH",
@@ -456,4 +671,6 @@ __all__ = [
     "air_quality_indices",
     "water_pollution_indices",
     "water_pollution_heatmap",
+    "built_index_heatmap",
+    "lst_heatmap",
 ]

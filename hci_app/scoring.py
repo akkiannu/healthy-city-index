@@ -18,27 +18,28 @@ def _minmax(value: float, minimum: float, maximum: float, invert: bool = False) 
 
 
 def compute_scores(data: RegionData) -> Dict[str, float]:
+    air_score = 0.5 * _minmax(data.air_pm25, 10, 100, invert=True) + 0.5 * _minmax(
+        data.air_no2, 5, 80, invert=True
+    )
+    water_score = _minmax(data.water_pollution, 0.85, 1.30, invert=True)
+    green_score = _minmax(data.ndvi, 0.1, 0.8)
+    built_score = _minmax(data.ndbi, -0.1, 0.6, invert=True)
     return {
-        "air": 0.5 * _minmax(data.air_pm25, 10, 100, invert=True)
-        + 0.5 * _minmax(data.air_no2, 5, 80, invert=True),
-        "water": _minmax(data.water_pollution, 0.85, 1.30, invert=True),
-        "green": _minmax(data.ndvi, 0.1, 0.8),
-        "population": _minmax(data.pop_density, 1_000, 30_000, invert=True),
-        "temperature": _minmax(data.lst_c, 26, 40, invert=True),
-        "industrial": _minmax(data.industrial_km, 0.1, 10.0),
+        "air": air_score,
+        "water": water_score,
+        "green": green_score,
+        "built": built_score,
     }
 
 
 def composite(scores: Dict[str, float]) -> float:
     weights = {
-        "air": 0.22,
-        "water": 0.14,
-        "green": 0.18,
-        "population": 0.12,
-        "temperature": 0.20,
-        "industrial": 0.14,
+        "air": 0.28,
+        "water": 0.22,
+        "green": 0.25,
+        "built": 0.25,
     }
-    value = sum(scores[key] * weights[key] for key in weights)
+    value = sum(scores[key] * weights.get(key, 0) for key in scores)
     return round(value, 3)
 
 
