@@ -34,8 +34,9 @@ from hci_app.earthengine import (
 )
 from hci_app.maps import map_layers, prepare_heatmap_dataframe, selection_to_point
 from hci_app.models import fetch_region_data
-from hci_app.raster import normalize_path, raster_dataframe, raster_value_from_path
+from hci_app.raster import raster_dataframe, raster_value_from_path
 from hci_app.scoring import clamp_value, compute_scores, recommendations
+from hci_app.llm import LLMUnavailable, llm_recommendations
 
 
 st.set_page_config(page_title="Healthy City Index — Mumbai", layout="wide")
@@ -745,6 +746,63 @@ def main() -> None:
                 "Swap this panel with real LLM outputs by forwarding indicators and"
                 " scores as structured context."
             )
+
+            st.divider()
+            st.subheader("AI action plan")
+            llm_placeholder = st.empty()
+            st.session_state.setdefault("llm_response", None)
+
+            def _llm_payload() -> Dict:
+                return {
+                    "location": {
+                        "lat": round(region.lat, 5),
+                        "lon": round(region.lon, 5),
+                    },
+                    "scores": {k: float(v) for k, v in scores.items()},
+                    "composite_hci": float(recs["hci"]),
+                    "metrics": {
+                        "pm2_5_ugm3": region.air_pm25,
+                        "no2_umolm2": region.air_no2,
+                        "co_umolm2": region.air_co,
+                        "co2_ppm": region.air_co2,
+                        "water_pollution_ratio": region.water_pollution,
+                        "ndvi": region.ndvi,
+                        "ndwi": region.ndwi,
+                        "ndbi": region.ndbi,
+                        "savi": region.savi,
+                        "population_density_per_km2": region.pop_density,
+                        "land_surface_temp_c": region.lst_c,
+                        "industrial_distance_km": region.industrial_km,
+                    },
+                    "data_sources": {
+                        "population_density": "raster" if population_real else "mock",
+                        "population_total": "raster" if population_total_real else "mock",
+                        "tree_cover": "raster" if treecover_real else "mock",
+                        "air_quality": "open-meteo API" if any(air_real.values()) else "mock",
+                        "water_pollution": "earth engine" if water_real else "mock",
+                    },
+                    "heatmap": heatmap_choice,
+                }
+
+            if st.button("Generate AI plan", type="primary"):
+                try:
+                    with st.spinner("Consulting urban-planning assistant..."):
+                        payload = _llm_payload()
+                        response_text = llm_recommendations(payload)
+                        st.session_state["llm_response"] = response_text
+                except LLMUnavailable as exc:
+                    st.session_state["llm_response"] = None
+                    llm_placeholder.warning(str(exc))
+                except Exception as exc:  # pragma: no cover
+                    st.session_state["llm_response"] = None
+                    llm_placeholder.error(f"AI request failed: {exc}")
+
+            if st.session_state["llm_response"]:
+                llm_placeholder.markdown(st.session_state["llm_response"])
+            elif not st.session_state.get("llm_response"):
+                llm_placeholder.caption(
+                    "Tip: set OPENAI_API_KEY in your environment to enable AI-generated action plans."
+                )
 
     st.divider()
     if mock_tracker["used"]:
