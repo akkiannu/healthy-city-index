@@ -9,13 +9,24 @@ custom vector layers once NASA data products are ready.
 
 from __future__ import annotations
 
+import datetime
+import io
+import textwrap
+import datetime
+import io
+import textwrap
 from pathlib import Path
 from dataclasses import replace
 from typing import Any, Dict, Optional
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from matplotlib import pyplot as plt
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 
 from hci_app.constants import (
     DEFAULT_POINT,
@@ -32,12 +43,14 @@ from hci_app.earthengine import (
     EarthEngineUnavailable,
     vegetation_indices as gee_vegetation_indices,
     built_index_heatmap as gee_built_index_heatmap,
+    lst_at_point as gee_lst_at_point,
+    lst_heatmap as gee_lst_heatmap,
     water_pollution_heatmap as gee_water_pollution_heatmap,
     water_pollution_indices as gee_water_pollution,
 )
-from hci_app.nasa import fetch_lst, fetch_lst_heatmap
+from hci_app.nasa import fetch_lst
 from hci_app.maps import map_layers, prepare_heatmap_dataframe, selection_to_point
-from hci_app.models import fetch_region_data
+from hci_app.models import RegionData, fetch_region_data
 from hci_app.raster import raster_dataframe, raster_value_from_path
 from hci_app.scoring import clamp_value, compute_scores, recommendations
 from hci_app.llm import LLMUnavailable, generate_plan
@@ -75,6 +88,9 @@ BASEMAP_TEMPLATES: Dict[str, str] = {
 }
 
 
+_PDF_MARGIN = 54  # 0.75 inches
+
+
 def _initialise_session_state() -> None:
     if "point" not in st.session_state:
         st.session_state.point = DEFAULT_POINT.copy()
@@ -91,6 +107,7 @@ def _radar_chart(scores: Dict[str, float]) -> go.Figure:
     ).update_layout(
         polar={"radialaxis": {"visible": True, "range": [0, 100]}},
         showlegend=False,
+        autosize=True,
         margin=dict(l=20, r=20, t=20, b=20),
     )
 
@@ -153,11 +170,296 @@ def _heatmap_legend_html(
     <span class="hci-legend-text">{low_text}</span>
     <div class="hci-legend-bar"></div>
     <span class="hci-legend-text">{high_text}</span>
-  </div>
+</div>
 </div>
 """
 
 
+def _simulate_urban_scenario(
+    base_region: RegionData, ndvi_target: float, ndbi_target: float
+) -> RegionData:
+    ndvi_clamped = clamp_value(ndvi_target, 0.0, 0.9)
+    ndbi_clamped = clamp_value(ndbi_target, -0.2, 0.7)
+
+    delta_green = ndvi_clamped - base_region.ndvi
+    delta_built = ndbi_clamped - base_region.ndbi
+
+    lst_sim = clamp_value(base_region.lst_c - 7.0 * delta_green + 5.0 * delta_built, 18.0, 45.0)
+    pm25_sim = clamp_value(base_region.air_pm25 - 30.0 * delta_green + 22.0 * delta_built, 5.0, 200.0)
+    no2_sim = clamp_value(base_region.air_no2 - 170.0 * delta_green + 130.0 * delta_built, 5.0, 500.0)
+    co_sim = clamp_value(base_region.air_co - 95.0 * delta_green + 85.0 * delta_built, 5.0, 500.0)
+    co2_sim = clamp_value(base_region.air_co2 - 18.0 * delta_green + 12.0 * delta_built, 350.0, 520.0)
+    water_sim = clamp_value(
+        base_region.water_pollution - 0.26 * delta_green + 0.18 * delta_built, 0.6, 1.8
+    )
+    ndwi_sim = clamp_value(base_region.ndwi + 0.45 * delta_green - 0.25 * delta_built, -0.4, 1.0)
+    savi_sim = clamp_value(base_region.savi + 0.55 * delta_green - 0.30 * delta_built, -1.0, 1.0)
+
+    return replace(
+        base_region,
+        ndvi=round(ndvi_clamped, 3),
+        ndbi=round(ndbi_clamped, 3),
+        ndwi=round(ndwi_sim, 3),
+        savi=round(savi_sim, 3),
+        lst_c=round(lst_sim, 1),
+        air_pm25=round(pm25_sim, 1),
+        air_no2=round(no2_sim, 1),
+        air_co=round(co_sim, 1),
+        air_co2=round(co2_sim, 1),
+        water_pollution=round(water_sim, 3),
+    )
+
+
+def _radar_chart_png(scores: Dict[str, float], title: str) -> bytes:
+    categories = ["Air", "Water", "Green", "Built"]
+    values = [max(0.0, min(1.0, scores.get(key.lower(), 0.0))) for key in categories]
+    angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+    values += values[:1]
+    angles += angles[:1]
+
+    fig = plt.figure(figsize=(3.6, 3.6), dpi=150)
+    ax = fig.add_subplot(111, polar=True)
+    ax.plot(angles, values, color="#1d4ed8", linewidth=2)
+    ax.fill(angles, values, color="#3b82f6", alpha=0.25)
+    ax.set_thetagrids(np.degrees(angles[:-1]), categories)
+    ax.set_ylim(0, 1)
+    ax.set_title(title, pad=20, fontsize=12, fontweight="bold")
+    ax.grid(color="#cbd5f5", linestyle="--", linewidth=0.6)
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _map_snapshot_png(region: RegionData, scenario_region: RegionData) -> bytes:
+    west, south, east, north = MUMBAI_BOUNDS
+    fig, ax = plt.subplots(figsize=(3.6, 3.6), dpi=150)
+    ax.set_facecolor("#f8fafc")
+    ax.add_patch(
+        plt.Rectangle(
+            (west, south),
+            east - west,
+            north - south,
+            fill=False,
+            linewidth=1.2,
+            edgecolor="#1f2937",
+        )
+    )
+    ax.scatter(
+        [region.lon],
+        [region.lat],
+        s=60,
+        color="#ef4444",
+        label="Selected location",
+        zorder=5,
+    )
+    ax.text(
+        region.lon,
+        region.lat + 0.01,
+        f"NDVI → {scenario_region.ndvi:.2f}\nNDBI → {scenario_region.ndbi:.2f}",
+        fontsize=8,
+        ha="center",
+        va="bottom",
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="#ffffff", alpha=0.9, edgecolor="#94a3b8"),
+    )
+    ax.set_xlim(west, east)
+    ax.set_ylim(south, north)
+    ax.set_xticks(np.linspace(west, east, 4))
+    ax.set_yticks(np.linspace(south, north, 4))
+    ax.tick_params(labelsize=8)
+    ax.set_title("Mumbai focus area", fontsize=12, fontweight="bold")
+    ax.grid(True, linestyle="--", linewidth=0.5, color="#cbd5f5")
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _render_lines(
+    can: canvas.Canvas,
+    lines: list[str],
+    margin: int,
+    page_height: int,
+    start_y: int,
+    line_height: int,
+) -> int:
+    y = start_y
+    for line in lines:
+        if y < margin + line_height:
+            can.showPage()
+            y = page_height - margin
+        can.drawString(margin, y, line)
+        y -= line_height
+    return y
+
+
+def _generate_pdf_report(
+    region: RegionData,
+    scores: Dict[str, float],
+    recs: Dict[str, str | float],
+    scenario_region: RegionData,
+    scenario_scores: Dict[str, float],
+    scenario_recs: Dict[str, str | float],
+    scenario_hci: float,
+    ai_text: Optional[str],
+    radar_png: Optional[bytes] = None,
+    map_png: Optional[bytes] = None,
+) -> bytes:
+    buffer = io.BytesIO()
+    can = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    margin = _PDF_MARGIN
+    page_height = int(height)
+    y = page_height - margin
+    line_height = 14
+
+    can.setFont("Helvetica-Bold", 18)
+    can.drawString(margin, y, "Healthy City Scenario Report")
+    can.setLineWidth(1)
+    can.line(margin, y - 4, width - margin, y - 4)
+    y -= 2 * line_height
+    can.setFont("Helvetica", 10)
+    can.drawString(
+        margin,
+        y,
+        f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    )
+    y -= int(1.5 * line_height)
+
+    can.setFont("Helvetica-Bold", 14)
+    can.drawString(margin, y, "Section 1 · Current Snapshot")
+    y -= line_height
+    can.setLineWidth(0.5)
+    can.line(margin, y, width - margin, y)
+    y -= int(1.2 * line_height)
+    can.setFont("Helvetica", 11)
+    current_lines = [
+        f"Location: {region.lat:.4f}, {region.lon:.4f}",
+        f"Healthy City Index: {recs['hci']:.2f}",
+        u"• Air quality · PM2.5 {region.air_pm25:.1f} µg/m³ · NO₂ {region.air_no2:.1f} µmol/m² · CO₂ {region.air_co2:.1f} ppm",
+        u"• Water quality · SWIR ratio {region.water_pollution:.3f}",
+        u"• Green assets · NDVI {region.ndvi:.3f} · SAVI {region.savi:.3f}",
+        u"• Built intensity · NDBI {region.ndbi:.3f}",
+        u"• Thermal comfort · LST {region.lst_c:.1f} °C",
+        u"• Density · {region.pop_density:,.0f} residents/km²",
+        u"• Habitability · " + str(recs["habitability"]),
+        u"• Parks & shade · " + str(recs["parks"]),
+        u"• Waste systems · " + str(recs["waste"]),
+        u"• Health resilience · " + str(recs["disease"]),
+    ]
+    y = _render_lines(can, current_lines, margin, page_height, y, line_height)
+    y -= line_height
+
+    can.setFont("Helvetica-Bold", 14)
+    can.drawString(margin, y, "Section 2 · AI Strategy & Scenario Insights")
+    y -= line_height
+    can.setLineWidth(0.5)
+    can.line(margin, y, width - margin, y)
+    y -= int(1.2 * line_height)
+    can.setFont("Helvetica", 11)
+    scenario_summary = [
+        "Scenario summary:",
+        u"• Target NDVI: {:.3f} (Δ {:+.3f})".format(
+            scenario_region.ndvi, scenario_region.ndvi - region.ndvi
+        ),
+        u"• Target NDBI: {:.3f} (Δ {:+.3f})".format(
+            scenario_region.ndbi, scenario_region.ndbi - region.ndbi
+        ),
+        u"• Projected LST: {:.1f} °C (Δ {:+.1f})".format(
+            scenario_region.lst_c, scenario_region.lst_c - region.lst_c
+        ),
+        u"• Projected PM2.5: {:.1f} µg/m³ (Δ {:+.1f})".format(
+            scenario_region.air_pm25, scenario_region.air_pm25 - region.air_pm25
+        ),
+        u"• Projected water ratio: {:.3f} (Δ {:+.3f})".format(
+            scenario_region.water_pollution,
+            scenario_region.water_pollution - region.water_pollution,
+        ),
+        u"• Projected HCI: {:.2f} (Δ {:+.2f})".format(
+            scenario_hci, scenario_hci - recs["hci"]
+        ),
+    ]
+    y = _render_lines(can, scenario_summary, margin, page_height, y, line_height)
+    y -= line_height
+
+    can.setFont("Helvetica", 11)
+    ai_lines: list[str] = []
+    if ai_text:
+        ai_lines.append("AI recommendation:")
+        for paragraph in ai_text.splitlines():
+            wrapped = textwrap.wrap(paragraph, width=90)
+            ai_lines.extend(wrapped or [""])
+    else:
+        ai_lines.append("AI recommendation unavailable. Generate the report once the assistant is reachable.")
+    y = _render_lines(can, ai_lines, margin, page_height, y, line_height)
+    y -= line_height
+
+    can.setFont("Helvetica-Bold", 14)
+    can.drawString(margin, y, "Appendix · Visuals & Contacts")
+    y -= line_height
+    can.setLineWidth(0.5)
+    can.line(margin, y, width - margin, y)
+    y -= int(1.2 * line_height)
+    appendix_lines = [
+        "• Radar chart: Healthy City pillar scores", 
+        "• Map overlays: latest heatmap selection and point analysis",
+        "• Municipal liaison (placeholder): +91 00000 00000 · resilience@city.gov",
+        "• Additional visualizations can be embedded in future iterations.",
+    ]
+    y = _render_lines(can, appendix_lines, margin, page_height, y, line_height)
+    y -= line_height
+
+    if radar_png or map_png:
+        if y < margin + 260:
+            can.showPage()
+            y = page_height - margin
+        if radar_png:
+            radar_reader = ImageReader(io.BytesIO(radar_png))
+            img_w, img_h = radar_reader.getSize()
+            max_width = (letter[0] - 2 * margin) / 2 - 12
+            scale = min(max_width / img_w, 220 / img_h)
+            draw_w = img_w * scale
+            draw_h = img_h * scale
+            can.drawImage(
+                radar_reader,
+                margin,
+                y - draw_h,
+                width=draw_w,
+                height=draw_h,
+                preserveAspectRatio=True,
+            )
+            can.setFont("Helvetica", 9)
+            can.drawString(margin, y - draw_h - 12, "Figure · HCI pillar radar chart")
+        if map_png:
+            map_reader = ImageReader(io.BytesIO(map_png))
+            img_w, img_h = map_reader.getSize()
+            max_width = (letter[0] - 2 * margin) / 2 - 12
+            scale = min(max_width / img_w, 220 / img_h)
+            draw_w = img_w * scale
+            draw_h = img_h * scale
+            x_pos = margin + ((letter[0] - 2 * margin) / 2) + 12
+            can.drawImage(
+                map_reader,
+                x_pos,
+                y - draw_h,
+                width=draw_w,
+                height=draw_h,
+                preserveAspectRatio=True,
+            )
+            can.setFont("Helvetica", 9)
+            can.drawString(x_pos, y - draw_h - 12, "Figure · Mumbai focus map")
+        y -= 240
+
+    can.save()
+    buffer.seek(0)
+    return buffer.read()
 def main() -> None:
     _initialise_session_state()
     st.session_state.setdefault("llm_response", None)
@@ -329,6 +631,7 @@ def main() -> None:
             heatmap_color_range: Optional[list[list[int]]] = None
             heatmap_colors: Optional[list[list[int]]] = None
             heatmap_legend: Optional[str] = None
+            built_index_median_value: Optional[float] = None
 
             if heatmap_choice == "Population density":
                 if population_raster_input:
@@ -439,36 +742,37 @@ def main() -> None:
                         "Water pollution heatmap requires Earth Engine credentials."
                     )
             elif heatmap_choice == "Land surface temp":
-                heatmap_df_raw, heatmap_info = fetch_lst_heatmap(
-                    MUMBAI_BOUNDS[3],
-                    MUMBAI_BOUNDS[1],
-                    MUMBAI_BOUNDS[2],
-                    MUMBAI_BOUNDS[0],
-                )
-                if heatmap_df_raw is not None:
-                    heatmap_colors = HEATMAP_COLOR_SCHEMES["Land surface temp"][
-                        "colors"
-                    ]
-                    heatmap_legend = HEATMAP_COLOR_SCHEMES["Land surface temp"].get(
-                        "legend"
+                if use_gee and gee_credentials_resolved is not None:
+                    heatmap_df_raw, heatmap_error_message = gee_lst_heatmap(
+                        MUMBAI_BOUNDS[3],
+                        MUMBAI_BOUNDS[1],
+                        MUMBAI_BOUNDS[2],
+                        MUMBAI_BOUNDS[0],
+                        credentials_path=gee_credentials_resolved,
                     )
-                    heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
-                        heatmap_df_raw, colors=heatmap_colors
-                    )
-                    heatmap_df_map["value_display"] = heatmap_df_map["value"].map(
-                        lambda v: f"{v:.1f}"
-                    )
-                    heatmap_label = "Land surface temp"
-                    heatmap_units = "°C"
-                    heatmap_color_range = heatmap_colors
-                    info_text = heatmap_info or "NASA POWER TS averages"
-                    heatmap_caption = (
-                        f"{heatmap_label} ≈ {vmin:.1f} – {vmax:.1f} {heatmap_units} · {info_text}"
-                    )
-                    heatmap_error_message = None
+                    if heatmap_df_raw is not None:
+                        heatmap_colors = HEATMAP_COLOR_SCHEMES["Land surface temp"][
+                            "colors"
+                        ]
+                        heatmap_legend = HEATMAP_COLOR_SCHEMES["Land surface temp"].get(
+                            "legend"
+                        )
+                        heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
+                            heatmap_df_raw, colors=heatmap_colors
+                        )
+                        heatmap_df_map["value_display"] = heatmap_df_map["value"].map(
+                            lambda v: f"{v:.1f}"
+                        )
+                        heatmap_label = "Land surface temp"
+                        heatmap_units = "°C"
+                        heatmap_color_range = heatmap_colors
+                        heatmap_caption = (
+                            f"{heatmap_label} ≈ {vmin:.1f} – {vmax:.1f} {heatmap_units}"
+                        )
+                        heatmap_error_message = None
                 else:
-                    heatmap_error_message = heatmap_info or (
-                        "NASA POWER returned no land surface temperature samples."
+                    heatmap_error_message = (
+                        "Land surface temp heatmap requires Earth Engine credentials."
                     )
             elif heatmap_choice == "Built index":
                 if use_gee and gee_credentials_resolved is not None:
@@ -480,6 +784,13 @@ def main() -> None:
                         credentials_path=gee_credentials_resolved,
                     )
                     if heatmap_df_raw is not None:
+                        valid_values = heatmap_df_raw["value"].dropna()
+                        if not valid_values.empty:
+                            built_index_median_value = float(valid_values.median())
+                            heatmap_df_raw = heatmap_df_raw.copy()
+                            heatmap_df_raw["value"] = heatmap_df_raw["value"].fillna(
+                                built_index_median_value
+                            )
                         heatmap_colors = HEATMAP_COLOR_SCHEMES["Built index"]["colors"]
                         heatmap_legend = HEATMAP_COLOR_SCHEMES["Built index"].get("legend")
                         heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
@@ -509,7 +820,6 @@ def main() -> None:
             )
             selection_state = st.pydeck_chart(
                 map_deck,
-                use_container_width=True,
                 selection_mode="single-object",
                 on_select="rerun",
                 key="map-explorer",
@@ -559,6 +869,7 @@ def main() -> None:
         water_quality_override: Optional[Dict[str, Optional[float]]] = None
         air_quality_override: Optional[Dict[str, Optional[float]]] = None
         lst_override: Optional[float] = None
+        lst_source: Optional[str] = None
 
         if use_gee and gee_credentials_resolved is not None:
             vegetation_status = st.empty()
@@ -576,6 +887,22 @@ def main() -> None:
                     vegetation_status.warning(f"⚠️ Earth Engine unavailable: {exc}")
                 except Exception as exc:  # pragma: no cover - network dependent
                     vegetation_status.warning(f"⚠️ Vegetation analysis failed: {exc}")
+
+            if vegetation_override and vegetation_override.get("ndbi") is None:
+                if built_index_median_value is None:
+                    built_df_for_median, _ = gee_built_index_heatmap(
+                        bounding_box["north"],
+                        bounding_box["south"],
+                        bounding_box["east"],
+                        bounding_box["west"],
+                        credentials_path=gee_credentials_resolved,
+                    )
+                    if built_df_for_median is not None and not built_df_for_median.empty:
+                        valid_values = built_df_for_median["value"].dropna()
+                        if not valid_values.empty:
+                            built_index_median_value = float(valid_values.median())
+                if built_index_median_value is not None:
+                    vegetation_override["ndbi"] = built_index_median_value
 
             water_status = st.empty()
             with st.spinner("🌊 Fetching water-quality proxies via Earth Engine..."):
@@ -604,12 +931,43 @@ def main() -> None:
             air_status.warning("⚠️ Air-quality service returned no data; using mock values.")
 
         lst_status = st.empty()
-        lst_value, lst_message = fetch_lst(point["lat"], point["lon"])
-        if lst_value is not None:
-            lst_override = lst_value
-            lst_status.success(f"✅ {lst_message}")
+        if use_gee and gee_credentials_resolved is not None:
+            gee_lst_value, gee_lst_message = gee_lst_at_point(
+                point["lat"],
+                point["lon"],
+                credentials_path=gee_credentials_resolved,
+            )
+            if gee_lst_value is not None:
+                lst_override = gee_lst_value
+                lst_source = "gee"
+                lst_status.success(
+                    f"✅ {gee_lst_message or 'Skin temperature via Earth Engine (MODIS).'}"
+                )
+            else:
+                gee_error = gee_lst_message or "Earth Engine returned no land surface temperature."
+                nasa_value, nasa_message = fetch_lst(point["lat"], point["lon"])
+                if nasa_value is not None:
+                    lst_override = nasa_value
+                    lst_source = "nasa"
+                    fallback_note = (
+                        nasa_message or "Skin temperature averaged from NASA POWER (daily TS)."
+                    )
+                    lst_status.warning(
+                        f"⚠️ {gee_error} Falling back to NASA POWER — {fallback_note}"
+                    )
+                else:
+                    fallback_note = nasa_message or "Skin temperature uses mock values."
+                    lst_status.warning(f"⚠️ {gee_error} {fallback_note}")
         else:
-            lst_status.warning(f"⚠️ {lst_message or 'Skin temperature uses mock values.'}")
+            nasa_value, nasa_message = fetch_lst(point["lat"], point["lon"])
+            if nasa_value is not None:
+                lst_override = nasa_value
+                lst_source = "nasa"
+                lst_status.success(f"✅ {nasa_message}")
+            else:
+                lst_status.warning(
+                    f"⚠️ {nasa_message or 'Skin temperature uses mock values.'}"
+                )
 
         if population_raster_input:
             density_value, density_error = raster_value_from_path(
@@ -719,7 +1077,7 @@ def main() -> None:
             st.dataframe(
                 pd.DataFrame(table_rows),
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
 
             st.markdown("### Composite HCI")
@@ -727,7 +1085,10 @@ def main() -> None:
             info = METRIC_IMPACTS.get("HCI (0–1, higher better)")
             if info:
                 st.caption(info)
-            st.plotly_chart(_radar_chart(scores), use_container_width=True)
+            st.plotly_chart(
+                _radar_chart(scores),
+                config={"responsive": True},
+            )
 
         source_notes = []
         source_notes.append(
@@ -742,9 +1103,15 @@ def main() -> None:
         source_notes.append(
             "Built index derived from Sentinel SWIR/NIR bands." if vegetation_real.get("ndbi") else "Built index currently uses mock values."
         )
-        source_notes.append(
-            "LST (earth skin temp) from NASA POWER." if lst_override is not None else "LST currently uses mock values."
-        )
+        if lst_override is not None:
+            if lst_source == "gee":
+                source_notes.append("LST (earth skin temp) from MODIS via Earth Engine.")
+            elif lst_source == "nasa":
+                source_notes.append("LST (earth skin temp) from NASA POWER.")
+            else:
+                source_notes.append("LST (earth skin temp) updated from remote data.")
+        else:
+            source_notes.append("LST currently uses mock values.")
 
         for note in source_notes:
             st.caption(note)
@@ -758,105 +1125,198 @@ def main() -> None:
         ):
             mock_tracker["used"] = True
 
+        scenario_origin_current = (round(region.lat, 5), round(region.lon, 5))
+        baseline_ndvi = float(region.ndvi)
+        baseline_ndbi = float(region.ndbi)
+
+        if "scenario_origin" not in st.session_state:
+            st.session_state["scenario_origin"] = scenario_origin_current
+            st.session_state["scenario_ndvi"] = baseline_ndvi
+            st.session_state["scenario_ndbi"] = baseline_ndbi
+        elif st.session_state.get("scenario_origin") != scenario_origin_current:
+            st.session_state["scenario_origin"] = scenario_origin_current
+            st.session_state["scenario_ndvi"] = baseline_ndvi
+            st.session_state["scenario_ndbi"] = baseline_ndbi
+
     with tab_ai:
-        col_left, col_right = st.columns([1.2, 1], gap="large")
+        st.subheader("Scenario simulator")
+        st.caption(
+            "Adjust greenery and built-up intensity to explore how cooling vegetation or densification"
+            " can shift environmental metrics and the overall Healthy City Index."
+        )
 
-        with col_left:
-            st.subheader("LLM Recommendations (stub)")
-            ai_metrics = [
-                ("Latitude", f"{region.lat:.5f}", True),
-                ("Longitude", f"{region.lon:.5f}", True),
-                ("PM2.5", f"{region.air_pm25} μg/m³", air_real.get("pm2_5", False)),
-                ("Land surface temp", f"{region.lst_c} °C", False),
-                ("Population density", f"{region.pop_density} /km²", population_real),
-                ("NO₂ (column)", f"{region.air_no2:.1f} µmol/m²", air_real.get("no2", False)),
-                ("CO (column)", f"{region.air_co:.1f} µmol/m²", air_real.get("co", False)),
-                ("CO₂", f"{region.air_co2:.1f} ppm", air_real.get("co2", False)),
-                ("Water pollution (SWIR ratio)", f"{region.water_pollution:.2f}", water_real),
-                ("NDVI", f"{region.ndvi:.3f}", vegetation_real.get("ndvi", False)),
-                ("NDWI", f"{region.ndwi:.3f}", vegetation_real.get("ndwi", False)),
-                ("NDBI", f"{region.ndbi:.3f}", vegetation_real.get("ndbi", False)),
-                ("SAVI", f"{region.savi:.3f}", vegetation_real.get("savi", False)),
-            ]
-            for label, value, is_real in ai_metrics:
-                display_label = f"{label}{'' if is_real else '*'}"
-                if not is_real:
-                    mock_tracker["used"] = True
-                st.metric(display_label, value)
-                info = METRIC_IMPACTS.get(label)
-                if info:
-                    st.caption(info)
+        control_cols = st.columns([1, 3], gap="large")
+        if control_cols[0].button(
+            "Reset scenario", help="Revert sliders to current observed values."
+        ):
+            st.session_state["scenario_origin"] = scenario_origin_current
+            st.session_state["scenario_ndvi"] = baseline_ndvi
+            st.session_state["scenario_ndbi"] = baseline_ndbi
+            rerun_fn = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+            if rerun_fn:
+                rerun_fn()
 
-        with col_right:
-            st.metric("Composite HCI", f"{recs['hci']:.2f}")
-            info = METRIC_IMPACTS.get("Composite HCI")
-            if info:
-                st.caption(info)
-            st.write("**Habitability:**", recs["habitability"])
-            st.write("**Parks / Greenery:**", recs["parks"])
-            st.write("**Waste Management:**", recs["waste"])
-            st.write("**Disease Risk:**", recs["disease"])
+        slider_cols = st.columns(2, gap="large")
+        greenery_target = slider_cols[0].slider(
+            "Target greenery (NDVI)",
+            min_value=0.0,
+            max_value=0.9,
+            value=float(st.session_state.get("scenario_ndvi", baseline_ndvi)),
+            step=0.01,
+            help="Higher NDVI represents richer vegetation cover.",
+            key="scenario_ndvi",
+        )
+        built_target = slider_cols[1].slider(
+            "Target built index (NDBI)",
+            min_value=-0.2,
+            max_value=0.7,
+            value=float(st.session_state.get("scenario_ndbi", baseline_ndbi)),
+            step=0.01,
+            help="Higher NDBI signals harder, more impervious surfaces.",
+            key="scenario_ndbi",
+        )
 
-            st.divider()
-            st.subheader("AI Action Plan")
-            llm_placeholder = st.empty()
+        scenario_region = _simulate_urban_scenario(region, greenery_target, built_target)
+        scenario_scores = compute_scores(scenario_region)
+        scenario_recs = recommendations(scenario_region, scenario_scores)
+        scenario_hci = scenario_recs["hci"]
 
-            if st.button("Generate AI plan", type="primary"):
-                payload: Dict[str, Any] = {
-                    "location": {
-                        "lat": round(region.lat, 5),
-                        "lon": round(region.lon, 5),
-                    },
-                    "composite_hci": round(float(recs["hci"]), 3),
-                    "pillar_notes": {
-                        "habitability": recs["habitability"],
-                        "parks_greenery": recs["parks"],
-                        "waste_management": recs["waste"],
-                        "disease_risk": recs["disease"],
-                    },
-                    "scores": {key: round(float(value), 3) for key, value in scores.items()},
-                    "metrics": {
-                        "pm2_5_ugm3": region.air_pm25,
-                        "no2_umolm2": region.air_no2,
-                        "co_umolm2": region.air_co,
-                        "co2_ppm": region.air_co2,
-                        "water_pollution_ratio": region.water_pollution,
-                        "ndvi": region.ndvi,
-                        "ndwi": region.ndwi,
-                        "ndbi": region.ndbi,
-                        "savi": region.savi,
-                        "population_density_per_km2": region.pop_density,
-                        "population_total_estimate": population_total_override,
-                        "tree_cover_percent": treecover_override,
-                        "land_surface_temp_c": region.lst_c,
-                        "industrial_distance_km": region.industrial_km,
-                        "heatmap_selected": heatmap_choice,
-                    },
-                    "data_quality": {
-                        "air": any(air_real.values()),
-                        "water": water_real,
-                        "green": vegetation_real.get("ndvi", False),
-                        "built": vegetation_real.get("ndbi", False),
-                    },
-                }
+        st.markdown("### Projected impact")
+        impact_cols = st.columns(4, gap="large")
+        impact_cols[0].metric(
+            "Land surface temp (°C)",
+            f"{scenario_region.lst_c:.1f}",
+            delta=f"{scenario_region.lst_c - region.lst_c:+.1f} °C",
+        )
+        impact_cols[1].metric(
+            "PM2.5 (µg/m³)",
+            f"{scenario_region.air_pm25:.1f}",
+            delta=f"{scenario_region.air_pm25 - region.air_pm25:+.1f}",
+        )
+        impact_cols[2].metric(
+            "Water pollution (ratio)",
+            f"{scenario_region.water_pollution:.3f}",
+            delta=f"{scenario_region.water_pollution - region.water_pollution:+.3f}",
+        )
+        impact_cols[3].metric(
+            "Healthy City Index",
+            f"{scenario_hci:.2f}",
+            delta=f"{scenario_hci - recs['hci']:+.2f}",
+        )
 
-                try:
-                    with st.spinner("Consulting urban-planning assistant..."):
-                        response_text = generate_plan(payload)
-                    st.session_state["llm_response"] = response_text
-                    st.session_state["llm_error"] = None
-                except LLMUnavailable as exc:
-                    st.session_state["llm_response"] = None
-                    st.session_state["llm_error"] = str(exc)
+        secondary_cols = st.columns(2, gap="large")
+        secondary_cols[0].metric(
+            "Green cover (NDVI)",
+            f"{scenario_region.ndvi:.3f}",
+            delta=f"{scenario_region.ndvi - region.ndvi:+.3f}",
+        )
+        secondary_cols[1].metric(
+            "Built index (NDBI)",
+            f"{scenario_region.ndbi:.3f}",
+            delta=f"{scenario_region.ndbi - region.ndbi:+.3f}",
+        )
 
-            if st.session_state.get("llm_response"):
-                llm_placeholder.markdown(st.session_state["llm_response"])
-            elif st.session_state.get("llm_error"):
-                llm_placeholder.warning(st.session_state["llm_error"])
-            else:
-                llm_placeholder.caption(
-                    "Tip: export OPENAI_API_KEY before launching the app to unlock AI-generated action plans."
-                )
+        st.markdown("### Scenario guidance")
+        st.write("**Habitability:**", scenario_recs["habitability"])
+        st.write("**Parks / Greenery:**", scenario_recs["parks"])
+        st.write("**Waste Management:**", scenario_recs["waste"])
+        st.write("**Disease Risk:**", scenario_recs["disease"])
+
+        st.divider()
+        st.subheader("AI Report")
+        llm_placeholder = st.empty()
+        report_feedback = st.empty()
+        download_placeholder = st.empty()
+
+        if st.button("Generate AI Report", type="primary"):
+            payload: Dict[str, Any] = {
+                "location": {
+                    "lat": round(region.lat, 5),
+                    "lon": round(region.lon, 5),
+                },
+                "composite_hci": round(float(scenario_hci), 3),
+                "pillar_notes": {
+                    "habitability": scenario_recs["habitability"],
+                    "parks_greenery": scenario_recs["parks"],
+                    "waste_management": scenario_recs["waste"],
+                    "disease_risk": scenario_recs["disease"],
+                },
+                "scores": {key: round(float(value), 3) for key, value in scenario_scores.items()},
+                "metrics": {
+                    "pm2_5_ugm3": scenario_region.air_pm25,
+                    "no2_umolm2": scenario_region.air_no2,
+                    "co_umolm2": scenario_region.air_co,
+                    "co2_ppm": scenario_region.air_co2,
+                    "water_pollution_ratio": scenario_region.water_pollution,
+                    "ndvi": scenario_region.ndvi,
+                    "ndwi": scenario_region.ndwi,
+                    "ndbi": scenario_region.ndbi,
+                    "savi": scenario_region.savi,
+                    "population_density_per_km2": scenario_region.pop_density,
+                    "population_total_estimate": population_total_override,
+                    "tree_cover_percent": treecover_override,
+                    "land_surface_temp_c": scenario_region.lst_c,
+                    "industrial_distance_km": scenario_region.industrial_km,
+                    "heatmap_selected": heatmap_choice,
+                    "simulated": True,
+                },
+                "data_quality": {
+                    "air": any(air_real.values()),
+                    "water": water_real,
+                    "green": vegetation_real.get("ndvi", False),
+                    "built": vegetation_real.get("ndbi", False),
+                },
+            }
+
+            try:
+                with st.spinner("Consulting urban-planning assistant..."):
+                    response_text = generate_plan(payload)
+                st.session_state["llm_response"] = response_text
+                st.session_state["llm_error"] = None
+            except LLMUnavailable as exc:
+                st.session_state["llm_response"] = None
+                st.session_state["llm_error"] = str(exc)
+            except Exception as exc:
+                st.session_state["llm_response"] = None
+                st.session_state["llm_error"] = f"AI request failed: {exc}"
+
+            ai_text = st.session_state.get("llm_response")
+            radar_png = _radar_chart_png(
+                {k: scenario_scores.get(k, 0.0) for k in ["air", "water", "green", "built"]},
+                "Scenario pillar mix",
+            )
+            map_png = _map_snapshot_png(region, scenario_region)
+            pdf_bytes = _generate_pdf_report(
+                region,
+                scores,
+                recs,
+                scenario_region,
+                scenario_scores,
+                scenario_recs,
+                scenario_hci,
+                ai_text,
+                radar_png=radar_png,
+                map_png=map_png,
+            )
+            st.session_state["ai_report_pdf"] = pdf_bytes
+            report_feedback.success("AI report prepared. Download below.")
+
+        if st.session_state.get("llm_response"):
+            llm_placeholder.markdown(st.session_state["llm_response"])
+        elif st.session_state.get("llm_error"):
+            llm_placeholder.warning(st.session_state["llm_error"])
+        else:
+            llm_placeholder.caption(
+                "Tip: export OPENAI_API_KEY before launching the app to unlock AI-generated reports."
+            )
+
+        if pdf_bytes := st.session_state.get("ai_report_pdf"):
+            download_placeholder.download_button(
+                label="Download AI Report (PDF)",
+                data=pdf_bytes,
+                file_name="healthy-city-report.pdf",
+                mime="application/pdf",
+            )
 
     st.divider()
     if mock_tracker["used"]:

@@ -11,3 +11,5 @@ geopandas
 folium>=0.14
 streamlit-folium>=0.13
 openai>=1.30
+reportlab>=4.4
+matplotlib>=3.8

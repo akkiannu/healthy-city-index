@@ -660,6 +660,94 @@ def lst_heatmap(
     return dataframe, None
 
 
+@lru_cache(maxsize=256)
+def _cached_lst_point(
+    lat: float,
+    lon: float,
+    start_date: str,
+    end_date: str,
+    credentials_path: Path,
+    scale: int,
+) -> Optional[float]:
+    status, error = initialise(credentials_path)
+    if not status:
+        raise EarthEngineUnavailable(error or "Earth Engine unavailable")
+
+    point = ee.Geometry.Point([lon, lat])
+    collection = (
+        ee.ImageCollection("MODIS/061/MOD11A2")
+        .select("LST_Day_1km")
+        .filterBounds(point)
+        .filterDate(start_date, end_date)
+    )
+
+    try:
+        lst_kelvin = collection.mean()
+    except Exception:
+        return None
+
+    lst_celsius = lst_kelvin.multiply(0.02).subtract(273.15).rename("lst_c")
+
+    try:
+        feature = (
+            lst_celsius.sample(
+                region=point.buffer(scale).bounds(),
+                scale=scale,
+                projection="EPSG:4326",
+                numPixels=1,
+                tileScale=4,
+            )
+            .first()
+        )
+        if feature is None:
+            return None
+        info = feature.getInfo()
+    except Exception:
+        return None
+
+    value = (info or {}).get("properties", {}).get("lst_c") if info else None
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def lst_at_point(
+    lat: float,
+    lon: float,
+    start_date: str = DEFAULT_WATER_DATE_RANGE[0],
+    end_date: str = DEFAULT_WATER_DATE_RANGE[1],
+    credentials_path: Optional[Path] = None,
+    scale: int = 1000,
+) -> Tuple[Optional[float], Optional[str]]:
+    path = credentials_path or DEFAULT_CREDENTIALS_PATH
+    try:
+        value = _cached_lst_point(
+            float(lat),
+            float(lon),
+            start_date,
+            end_date,
+            path.resolve(),
+            scale,
+        )
+    except EarthEngineUnavailable as exc:
+        return None, str(exc)
+    except Exception as exc:
+        return None, str(exc)
+
+    if value is None:
+        return None, "LST dataset returned no sample at this location."
+
+    message = (
+        "Skin temperature from MODIS (Earth Engine)"
+        f" · {start_date} to {end_date}"
+    )
+    return value, message
+
+
 __all__ = [
     "EarthEngineUnavailable",
     "DEFAULT_CREDENTIALS_PATH",
@@ -673,4 +761,5 @@ __all__ = [
     "water_pollution_heatmap",
     "built_index_heatmap",
     "lst_heatmap",
+    "lst_at_point",
 ]
