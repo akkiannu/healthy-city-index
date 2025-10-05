@@ -9,355 +9,27 @@ custom vector layers once NASA data products are ready.
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import pydeck as pdk
-import rasterio
-from rasterio.transform import xy
-from rasterio.windows import from_bounds
 import streamlit as st
+
+from hci_app.constants import (
+    DEFAULT_POINT,
+    DEFAULT_POP_DENSITY_RASTER,
+    DEFAULT_POP_TOTAL_RASTER,
+    DEFAULT_TREECOVER_RASTER,
+    HEATMAP_COLOR_SCHEMES,
+    MUMBAI_BOUNDS,
+)
+from hci_app.maps import map_layers, prepare_heatmap_dataframe, selection_to_point
+from hci_app.models import fetch_region_data
+from hci_app.raster import raster_dataframe, raster_value_from_path
+from hci_app.scoring import clamp_value, compute_scores, recommendations
 
 
 st.set_page_config(page_title="Healthy City Index — Mumbai", layout="wide")
-
-ROOT_DIR = Path(__file__).resolve().parent
-DATA_DIR = ROOT_DIR / "data"
-
-# Pre-fill defaults when well-known rasters exist in ./data
-DEFAULT_POP_DENSITY_RASTER = DATA_DIR / "ind_pd_2020_1km_UNadj.tif"
-DEFAULT_POP_TOTAL_RASTER = DATA_DIR / "ind_pop_2025_CN_1km_R2025A_UA_v1.tif"
-
-
-@dataclass(frozen=True)
-class RegionData:
-    lat: float
-    lon: float
-    air_pm25: float
-    air_no2: float
-    water_turbidity: float
-    ndvi: float
-    pop_density: float
-    lst_c: float
-    industrial_km: float
-
-
-DEFAULT_POINT: Dict[str, float] = {"lat": 19.0760, "lon": 72.8777}
-DEFAULT_REGION = RegionData(
-    lat=DEFAULT_POINT["lat"],
-    lon=DEFAULT_POINT["lon"],
-    air_pm25=40.0,
-    air_no2=25.0,
-    water_turbidity=5.0,
-    ndvi=0.40,
-    pop_density=12_000,
-    lst_c=32.0,
-    industrial_km=3.0,
-)
-
-MUMBAI_BOUNDS = (72.76, 18.89, 73.04, 19.33)  # (west, south, east, north)
-
-DEFAULT_HEATMAP_COLORS = [
-    [226, 232, 240],
-    [148, 163, 184],
-    [71, 85, 105],
-]
-
-HEATMAP_COLOR_SCHEMES = {
-    "Population density": {
-        "colors": [
-            [255, 245, 240],
-            [254, 224, 210],
-            [252, 187, 161],
-            [252, 146, 114],
-            [251, 106, 74],
-            [222, 45, 38],
-            [165, 15, 21],
-        ],
-    },
-    "Population total": {
-        "colors": [
-            [242, 240, 247],
-            [218, 218, 235],
-            [188, 189, 220],
-            [158, 154, 200],
-            [128, 125, 186],
-            [106, 81, 163],
-            [74, 20, 134],
-        ],
-    },
-    "Tree cover": {
-        "colors": [
-            [237, 248, 233],
-            [199, 233, 192],
-            [161, 217, 155],
-            [116, 196, 118],
-            [65, 171, 93],
-            [35, 139, 69],
-            [0, 90, 50],
-        ],
-    },
-}
-
-
-def _generate_click_grid(
-    bounds: Tuple[float, float, float, float], step: float = 0.01
-) -> pd.DataFrame:
-    west, south, east, north = bounds
-    lat_values = np.arange(south, north + step, step)
-    lon_values = np.arange(west, east + step, step)
-    lon_grid, lat_grid = np.meshgrid(lon_values, lat_values)
-    df = pd.DataFrame(
-        {
-            "lon": lon_grid.ravel(),
-            "lat": lat_grid.ravel(),
-        }
-    )
-    df["lat_display"] = df["lat"].map(lambda v: f"{v:.4f}")
-    df["lon_display"] = df["lon"].map(lambda v: f"{v:.4f}")
-    return df
-
-
-MAP_CLICK_GRID = _generate_click_grid(MUMBAI_BOUNDS)
-
-TREECOVER_DIR = DATA_DIR / "treecover"
-DEFAULT_TREECOVER_RASTER = None
-if TREECOVER_DIR.exists():
-    for candidate in ["10N_070E.tif", "20N_070E.tif", "30N_070E.tif"]:
-        path = TREECOVER_DIR / candidate
-        if path.exists():
-            DEFAULT_TREECOVER_RASTER = path
-            break
-
-
-def _normalize_path(path: str) -> Optional[str]:
-    if not path:
-        return None
-    candidate = Path(path).expanduser()
-    if not candidate.exists() and not candidate.is_absolute():
-        alt = DATA_DIR / candidate
-        if alt.exists():
-            candidate = alt
-    try:
-        resolved = candidate.resolve(strict=False)
-    except FileNotFoundError:
-        return None
-    return str(resolved)
-
-
-@st.cache_resource(show_spinner=False)
-def _load_raster(path: str):
-    return rasterio.open(path)
-
-
-@st.cache_data(show_spinner=False)
-def _sample_raster(path: str, lat: float, lon: float) -> Optional[float]:
-    dataset = _load_raster(path)
-    try:
-        sample = next(dataset.sample([(lon, lat)]))[0]
-    except StopIteration:
-        return None
-    except Exception:
-        raise
-    if dataset.nodata is not None and sample == dataset.nodata:
-        return None
-    if np.isnan(sample):
-        return None
-    return float(sample)
-
-
-def _raster_value_from_path(
-    path: str, lat: float, lon: float
-) -> Tuple[Optional[float], Optional[str]]:
-    normalized = _normalize_path(path)
-    if not normalized or not Path(normalized).exists():
-        return None, "Raster not found at the provided path."
-    try:
-        value = _sample_raster(normalized, lat, lon)
-    except Exception as exc:
-        return None, f"Failed to sample raster: {exc}"
-    if value is None:
-        return None, "Raster returned no data at this location."
-    return value, None
-
-
-@st.cache_data(show_spinner=False)
-def _raster_dataframe(
-    path: str,
-    bounds: Tuple[float, float, float, float],
-    max_points: int = 8000,
-) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    normalized = _normalize_path(path)
-    if not normalized or not Path(normalized).exists():
-        return None, "Raster not found at the provided path."
-
-    dataset = _load_raster(normalized)
-    window = from_bounds(*bounds, dataset.transform)
-    data = dataset.read(1, window=window, masked=True)
-    if data.size == 0:
-        return None, "Raster returned no data inside the map bounds."
-
-    mask = ~data.mask
-    rows, cols = np.where(mask)
-    if rows.size == 0:
-        return None, "Raster returned no valid pixels in the map bounds."
-
-    values = data.data[rows, cols].astype(float)
-    if rows.size > max_points:
-        idx = np.linspace(0, rows.size - 1, max_points, dtype=int)
-        rows = rows[idx]
-        cols = cols[idx]
-        values = values[idx]
-
-    transform = dataset.window_transform(window)
-    xs, ys = xy(transform, rows, cols)
-    df = pd.DataFrame({"lon": xs, "lat": ys, "value": values})
-    return df, None
-
-
-def _prepare_heatmap_dataframe(
-    df: pd.DataFrame, colors: Optional[list[list[int]]] = None
-) -> Tuple[pd.DataFrame, float, float]:
-    vmin = float(df["value"].min())
-    vmax = float(df["value"].max())
-    if math.isclose(vmin, vmax):
-        vmax = vmin + 1e-6
-
-    normalized = (df["value"] - vmin) / (vmax - vmin)
-    dataframe = df.copy()
-    palette = np.array(colors if colors else DEFAULT_HEATMAP_COLORS, dtype=float)
-    if palette.shape[0] < 2:
-        palette = np.vstack([palette, palette])
-    stops = np.linspace(0.0, 1.0, palette.shape[0])
-    values = normalized.to_numpy()
-    color_r = np.interp(values, stops, palette[:, 0])
-    color_g = np.interp(values, stops, palette[:, 1])
-    color_b = np.interp(values, stops, palette[:, 2])
-    dataframe["color_r"] = np.clip(color_r, 0, 255).astype(int)
-    dataframe["color_g"] = np.clip(color_g, 0, 255).astype(int)
-    dataframe["color_b"] = np.clip(color_b, 0, 255).astype(int)
-    dataframe["value_display"] = dataframe["value"].map(lambda v: f"{v:,.2f}")
-    dataframe["lat_display"] = dataframe["lat"].map(lambda v: f"{v:.4f}")
-    dataframe["lon_display"] = dataframe["lon"].map(lambda v: f"{v:.4f}")
-    return dataframe, vmin, vmax
-
-
-def _noise(lat: float, lon: float, seed: int) -> float:
-    return abs(math.sin(lat * 5 + lon * 3 + seed)) % 1.0
-
-
-def fetch_region_data(
-    lat: float,
-    lon: float,
-    population_density: Optional[float] = None,
-) -> RegionData:
-    n = [_noise(lat, lon, i) for i in range(1, 8)]
-    try:
-        region = RegionData(
-            lat=lat,
-            lon=lon,
-            air_pm25=round(20 + 80 * n[0], 1),
-            air_no2=round(10 + 60 * n[1], 1),
-            water_turbidity=round(1 + 15 * n[2], 1),
-            ndvi=round(0.15 + 0.6 * n[3], 2),
-            pop_density=int(round(3000 + 25_000 * n[4])),
-            lst_c=round(28 + 10 * n[5], 1),
-            industrial_km=round(0.1 + 8.0 * n[6], 2),
-        )
-        if population_density is not None:
-            region = replace(region, pop_density=float(population_density))
-        return region
-    except Exception:
-        return DEFAULT_REGION
-
-
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-def _minmax(v: float, lo: float, hi: float, invert: bool = False) -> float:
-    x = _clamp(v, lo, hi)
-    score = (x - lo) / (hi - lo or 1)
-    return 1 - score if invert else score
-
-
-def compute_scores(data: RegionData) -> Dict[str, float]:
-    return {
-        "air": 0.5 * _minmax(data.air_pm25, 10, 100, invert=True)
-        + 0.5 * _minmax(data.air_no2, 5, 80, invert=True),
-        "water": _minmax(data.water_turbidity, 1, 20, invert=True),
-        "green": _minmax(data.ndvi, 0.1, 0.8),
-        "population": _minmax(data.pop_density, 1_000, 30_000, invert=True),
-        "temperature": _minmax(data.lst_c, 26, 40, invert=True),
-        "industrial": _minmax(data.industrial_km, 0.1, 10.0),
-    }
-
-
-def composite(scores: Dict[str, float]) -> float:
-    weights = {
-        "air": 0.22,
-        "water": 0.14,
-        "green": 0.18,
-        "population": 0.12,
-        "temperature": 0.20,
-        "industrial": 0.14,
-    }
-    value = sum(scores[k] * weights[k] for k in weights)
-    return round(value, 3)
-
-
-def recommendations(data: RegionData, scores: Dict[str, float]) -> Dict[str, str | float]:
-    hci = composite(scores)
-    habitability = (
-        "Generally habitable – favorable profile."
-        if hci >= 0.7
-        else "Marginally habitable – mixed; targeted fixes."
-        if hci >= 0.5
-        else "Not ideal – multiple risks; mitigate first."
-    )
-
-    if data.ndvi >= 0.45:
-        parks = "Adequate greenery; preserve & add pocket parks."
-    elif data.ndvi >= 0.30:
-        parks = "Moderate greenery; corridor greening & shade trees."
-    else:
-        parks = "Low greenery; prioritize parks & streetscape planting."
-
-    if data.pop_density > 15_000 and data.industrial_km < 2:
-        waste = "High waste pressure; deploy MRF/transfer stations & audits."
-    elif data.pop_density > 15_000:
-        waste = "Elevated waste; scale collection & segregation."
-    else:
-        waste = "Standard services likely sufficient; maintain programs."
-
-    risk = sum(
-        [
-            data.air_pm25 > 60,
-            data.lst_c > 34,
-            data.pop_density > 20_000,
-            data.water_turbidity > 10,
-        ]
-    )
-    disease = (
-        "High risk: clinics, heat shelters, vector control, potable water."
-        if risk >= 3
-        else "Moderate risk: monitor hotspots, shade/water points, seasonal drives."
-        if risk == 2
-        else "Low–moderate risk: routine surveillance & outreach."
-    )
-
-    return {
-        "hci": hci,
-        "habitability": habitability,
-        "parks": parks,
-        "waste": waste,
-        "disease": disease,
-    }
 
 
 def _initialise_session_state() -> None:
@@ -365,167 +37,13 @@ def _initialise_session_state() -> None:
         st.session_state.point = DEFAULT_POINT.copy()
 
 
-def _map_layers(
-    point: Dict[str, float],
-    heatmap_df: Optional[pd.DataFrame] = None,
-    heatmap_label: str = "",
-    heatmap_units: str = "",
-    heatmap_color_range: Optional[list[list[int]]] = None,
-) -> Tuple[pdk.Deck, Dict[str, float]]:
-    view_state = pdk.ViewState(
-        latitude=point["lat"], longitude=point["lon"], zoom=11, pitch=0
-    )
-
-    # Approximate bounding box for Greater Mumbai (covers island city + suburbs).
-    rectangle = [
-        [72.76, 18.89],
-        [73.04, 18.89],
-        [73.04, 19.33],
-        [72.76, 19.33],
-    ]
-
-    rectangle_layer = pdk.Layer(
-        "PolygonLayer",
-        data=[{"polygon": rectangle}],
-        id="mumbai-boundary",
-        get_polygon="polygon",
-        get_fill_color=[252, 165, 165, 60],
-        get_line_color=[248, 113, 113, 200],
-        line_width_min_pixels=1,
-    )
-
-    grid_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=MAP_CLICK_GRID,
-        id="map-click-grid",
-        get_position="[lon, lat]",
-        get_radius=90,
-        get_fill_color="[255, 255, 255, 16]",
-        opacity=0.05,
-        stroked=False,
-        pickable=True,
-    )
-
-    layers = [rectangle_layer, grid_layer]
-
-    tooltip_html = "<b>Lat:</b> {lat}<br/><b>Lon:</b> {lon}"
-    tooltip_style = {"backgroundColor": "#0f172a", "color": "#f8fafc"}
-
-    if heatmap_df is not None and not heatmap_df.empty:
-        heatmap_layer = pdk.Layer(
-            "HeatmapLayer",
-            data=heatmap_df,
-            id="heatmap-layer",
-            get_position="[lon, lat]",
-            get_weight="value",
-            radius_pixels=60,
-            aggregation="MEAN",
-            color_range=heatmap_color_range,
-        )
-        hover_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=heatmap_df,
-            id="heatmap-points",
-            get_position="[lon, lat]",
-            get_fill_color="[color_r, color_g, color_b, 120]",
-            get_line_color="[color_r, color_g, color_b, 200]",
-            get_radius=80,
-            pickable=True,
-            auto_highlight=True,
-        )
-        layers.extend([heatmap_layer, hover_layer])
-        if heatmap_label:
-            tooltip_html += f"<br/><b>{heatmap_label}:</b> {{value_display}}"
-            if heatmap_units:
-                tooltip_html += f" {heatmap_units}"
-
-    point_df = pd.DataFrame([
-        {
-            "lat": point["lat"],
-            "lon": point["lon"],
-            "lat_display": f"{point['lat']:.4f}",
-            "lon_display": f"{point['lon']:.4f}",
-        }
-    ])
-
-    point_layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=point_df,
-        id="selected-point",
-        get_position="[lon, lat]",
-        get_radius=220,
-        get_fill_color=[17, 24, 39, 255],
-        get_line_color=[248, 250, 252, 200],
-        pickable=True,
-        auto_highlight=True,
-        line_width_min_pixels=1,
-    )
-    layers.append(point_layer)
-
-    deck = pdk.Deck(
-        map_style=None,
-        initial_view_state=view_state,
-        layers=layers,
-        tooltip={"html": tooltip_html, "style": tooltip_style},
-    )
-    return deck, view_state.__dict__
-
-
-def _first_float(mapping: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[float]:
-    for key in keys:
-        value = mapping.get(key)
-        if value is None:
-            continue
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _point_from_object(obj: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-    lat = _first_float(obj, ("lat", "Lat", "latitude", "Latitude", "LATITUDE"))
-    lon = _first_float(obj, ("lon", "Lon", "longitude", "Longitude", "LONGITUDE"))
-    if lat is not None and lon is not None:
-        return lat, lon
-    position = obj.get("position") or obj.get("coordinates")
-    if position and len(position) >= 2:
-        try:
-            lon_value, lat_value = float(position[0]), float(position[1])
-        except (TypeError, ValueError):
-            return None
-        return lat_value, lon_value
-    return None
-
-
-def _selection_to_point(selection: Optional[Dict[str, Any]]) -> Optional[Tuple[float, float]]:
-    if not selection:
-        return None
-    event = selection.get("selection")
-    if not event:
-        return None
-    objects_by_layer = event.get("objects")
-    if not objects_by_layer:
-        return None
-    preferred_layers = ["heatmap-points", "map-click-grid", "selected-point", "heatmap-layer"]
-    for layer_id in preferred_layers:
-        for obj in objects_by_layer.get(layer_id, []):
-            point = _point_from_object(obj)
-            if point:
-                return point
-    for obj_list in objects_by_layer.values():
-        for obj in obj_list:
-            point = _point_from_object(obj)
-            if point:
-                return point
-    return None
-
-
 def _radar_chart(scores: Dict[str, float]) -> go.Figure:
     categories = ["Air", "Water", "Green", "Population", "Temperature", "Industrial"]
-    values = [round(scores[k.lower()], 3) * 100 for k in categories]
+    values = [round(scores[key.lower()], 3) * 100 for key in categories]
     return go.Figure(
-        data=go.Scatterpolar(r=values + values[:1], theta=categories + categories[:1], fill="toself")
+        data=go.Scatterpolar(
+            r=values + values[:1], theta=categories + categories[:1], fill="toself"
+        )
     ).update_layout(
         polar={"radialaxis": {"visible": True, "range": [0, 100]}},
         showlegend=False,
@@ -662,14 +180,14 @@ def main() -> None:
 
             if heatmap_choice == "Population density":
                 if population_raster_input:
-                    heatmap_df_raw, heatmap_error_message = _raster_dataframe(
+                    heatmap_df_raw, heatmap_error_message = raster_dataframe(
                         population_raster_input, MUMBAI_BOUNDS
                     )
                     if heatmap_df_raw is not None:
                         heatmap_colors = HEATMAP_COLOR_SCHEMES["Population density"][
                             "colors"
                         ]
-                        heatmap_df_map, vmin, vmax = _prepare_heatmap_dataframe(
+                        heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
                             heatmap_df_raw, colors=heatmap_colors
                         )
                         heatmap_df_map["value_display"] = heatmap_df_map["value"].map(
@@ -686,14 +204,14 @@ def main() -> None:
                     heatmap_error_message = "Population density raster not configured."
             elif heatmap_choice == "Population total":
                 if population_total_input:
-                    heatmap_df_raw, heatmap_error_message = _raster_dataframe(
+                    heatmap_df_raw, heatmap_error_message = raster_dataframe(
                         population_total_input, MUMBAI_BOUNDS
                     )
                     if heatmap_df_raw is not None:
                         heatmap_colors = HEATMAP_COLOR_SCHEMES["Population total"][
                             "colors"
                         ]
-                        heatmap_df_map, vmin, vmax = _prepare_heatmap_dataframe(
+                        heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
                             heatmap_df_raw, colors=heatmap_colors
                         )
                         heatmap_df_map["value_display"] = heatmap_df_map["value"].map(
@@ -710,12 +228,12 @@ def main() -> None:
                     heatmap_error_message = "Population total raster not configured."
             elif heatmap_choice == "Tree cover":
                 if treecover_input:
-                    heatmap_df_raw, heatmap_error_message = _raster_dataframe(
+                    heatmap_df_raw, heatmap_error_message = raster_dataframe(
                         treecover_input, MUMBAI_BOUNDS
                     )
                     if heatmap_df_raw is not None:
                         heatmap_colors = HEATMAP_COLOR_SCHEMES["Tree cover"]["colors"]
-                        heatmap_df_map, vmin, vmax = _prepare_heatmap_dataframe(
+                        heatmap_df_map, vmin, vmax = prepare_heatmap_dataframe(
                             heatmap_df_raw, colors=heatmap_colors
                         )
                         heatmap_df_map["value_display"] = heatmap_df_map["value"].map(
@@ -731,7 +249,7 @@ def main() -> None:
                 else:
                     heatmap_error_message = "Tree cover raster not configured."
 
-            map_deck, _ = _map_layers(
+            map_deck, _ = map_layers(
                 point,
                 heatmap_df=heatmap_df_map,
                 heatmap_label=heatmap_label,
@@ -745,12 +263,12 @@ def main() -> None:
                 on_select="rerun",
                 key="map-explorer",
             )
-            selected_point = _selection_to_point(selection_state)
+            selected_point = selection_to_point(selection_state)
             if selected_point:
-                selected_lat = _clamp(
+                selected_lat = clamp_value(
                     float(selected_point[0]), MUMBAI_BOUNDS[1], MUMBAI_BOUNDS[3]
                 )
-                selected_lon = _clamp(
+                selected_lon = clamp_value(
                     float(selected_point[1]), MUMBAI_BOUNDS[0], MUMBAI_BOUNDS[2]
                 )
                 current_point = st.session_state.point
@@ -779,23 +297,24 @@ def main() -> None:
                 st.warning(heatmap_error_message)
             elif heatmap_caption:
                 st.caption(heatmap_caption)
-        point = st.session_state.point
+
         population_override = None
         population_total_override = None
         treecover_override = None
+
         if population_raster_input:
-            population_value, population_error = _raster_value_from_path(
+            density_value, density_error = raster_value_from_path(
                 population_raster_input, point["lat"], point["lon"]
             )
-            if population_error:
-                population_status_placeholder.warning(population_error)
+            if density_error:
+                population_status_placeholder.warning(density_error)
             else:
-                population_override = population_value
+                population_override = density_value
                 population_status_placeholder.success(
-                    f"Population density sample: {population_override:,.1f} people/km²"
+                    f"Population density sample: {population_override:,.0f} people/km²"
                 )
         if population_total_input:
-            pop_total_value, pop_total_error = _raster_value_from_path(
+            pop_total_value, pop_total_error = raster_value_from_path(
                 population_total_input, point["lat"], point["lon"]
             )
             if pop_total_error:
@@ -806,7 +325,7 @@ def main() -> None:
                     f"Population total sample: {population_total_override:,.0f} people"
                 )
         if treecover_input:
-            treecover_value, treecover_error = _raster_value_from_path(
+            treecover_value, treecover_error = raster_value_from_path(
                 treecover_input, point["lat"], point["lon"]
             )
             if treecover_error:
