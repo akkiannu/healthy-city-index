@@ -738,10 +738,10 @@ def main() -> None:
             st.subheader(f"📊 Indicators @ {region.lat:.4f}, {region.lon:.4f}")
 
             pillar_descriptions = {
-                "air": "Blend of PM₂.₅ + NO₂ (higher = cleaner air).",
-                "water": "SWIR turbidity proxy (higher = murkier water).",
-                "green": "Vegetation cover index (higher = greener).",
-                "built": "Normalized difference built-up index (higher = harder surfaces).",
+                "air": "Blend of PM₂.₅ + NO₂ (lower scores mean cleaner air).",
+                "water": "SWIR turbidity proxy (lower scores mean clearer water).",
+                "green": "Vegetation cover index (higher scores mean greener blocks).",
+                "built": "Normalized difference built-up index (lower scores mean softer surfaces).",
             }
 
             table_rows = []

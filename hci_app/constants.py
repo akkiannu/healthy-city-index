@@ -115,8 +115,8 @@ HEATMAP_COLOR_SCHEMES = {
 
 
 PILLAR_DISPLAY = {
-    "air": "Air",
-    "water": "Water",
+    "air": "Air pollution",
+    "water": "Water pollution",
     "green": "Green",
     "built": "Built index",
 }

@@ -4,13 +4,13 @@ This document captures the transformations we apply on top of raw data sources b
 
 ## Scoring and normalisation
 
-| Feature | Transformation | Purpose |
-| --- | --- | --- |
-| Air score | Combination of PM2.5 and NO₂, min-max scaled (higher is better) with `compute_scores` in `hci_app/scoring.py`. | Penalises both particulate matter and NO₂ exceedances. |
-| Water score | SWIR turbidity ratio, inverted min-max scaling. | Flags higher turbidity / pollution. |
-| Green score | NDVI scaled to [0,1]. | Captures vegetation vigour. |
-| Built score | NDBI scaled and inverted. | Rewards softer, less impervious surfaces. |
-| Composite HCI | Weighted blend of the four pillar scores (Air 0.28, Water 0.22, Green 0.25, Built 0.25). | Produces a single headline number for comparisons. |
+| Feature | Transformation | Formula | Purpose |
+| --- | --- | --- | --- |
+| Air pollution score | Combination of PM2.5 and NO₂ with inverse min-max scaling. | \\(0.5 	imes rac{100 - (\mathrm{PM}_{2.5}-10)}{90} + 0.5 	imes rac{80 - (\mathrm{NO}_2-5)}{75}\\) (clamped 0–1) | Penalises both particulate matter and NO₂ exceedances. |
+| Water pollution score | SWIR turbidity ratio with inverse min-max scaling. | \\(1 - rac{	ext{SWIR} - 0.85}{1.30 - 0.85}\\) (clamped 0–1) | Flags higher turbidity / pollution. |
+| Green score | NDVI scaled between 0.1 and 0.8. | \\(rac{	ext{NDVI} - 0.1}{0.8 - 0.1}\\) (clamped 0–1) | Captures vegetation vigour. |
+| Built score | NDBI scaled between −0.1 and 0.6, inverted. | \\(1 - rac{	ext{NDBI} + 0.1}{0.6 + 0.1}\\) (clamped 0–1) | Rewards softer, less impervious surfaces. |
+| Composite HCI | Weighted blend of pillar scores. | \\(0.28 	imes s_{air} + 0.22 	imes s_{water} + 0.25 	imes s_{green} + 0.25 	imes s_{built}\\) | Produces a single headline number for comparisons. |
 
 All min/max helpers clamp inputs to defensively handle missing or extreme values.
 
