@@ -1,0 +1,11 @@
+streamlit>=1.37
+pandas>=2.2
+numpy>=1.26
+pydeck>=0.8
+plotly>=5.22
+rasterio>=1.3
+earthengine-api 
+requests>=2.31
+geopandas
+folium>=0.14
+streamlit-folium>=0.13
